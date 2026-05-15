@@ -36,6 +36,7 @@ PROBE_TIMEOUT_SECONDS = 10
 # needs more slack than an already-warm daemon probe.
 FETCH_TIMEOUT_SECONDS = 30
 STATUS_RESPONSE_MAX = 2 * 1024 * 1024  # 2 MiB cap on dashboard payload
+MAX_CONCURRENT_PROBES = 50  # cap concurrent outbound connections per cycle
 
 
 async def _log_conn_type(net, node_id_str: str, label: str, tag: str) -> None:
@@ -295,6 +296,7 @@ class MonitorEngine:
         self._node_id_str: str = node_id
         self._signing_key: nacl.signing.SigningKey = nacl.signing.SigningKey(secret_key)
         self.shutdown_event: asyncio.Event = asyncio.Event()
+        self._probe_semaphore: asyncio.Semaphore = asyncio.Semaphore(MAX_CONCURRENT_PROBES)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -360,7 +362,7 @@ class MonitorEngine:
             name="Heartbeat Cycle",
         )
         self._scheduler.add_job(
-            self._history.prune_older_than,
+            self._run_history_gc,
             trigger="interval",
             hours=1,
             id="history_gc",
@@ -382,6 +384,14 @@ class MonitorEngine:
 
         # Local HTTP dashboard. Purely local UI — no peer traffic.
         if self._status_bind:
+            # Warn if binding to a non-loopback address (no auth on the HTTP page).
+            _host = self._status_bind.rpartition(":")[0]
+            if _host and _host not in ("127.0.0.1", "localhost", "::1"):
+                logger.warning(
+                    "[init] status page binding to non-loopback address '{}' — "
+                    "the HTTP dashboard has no authentication!",
+                    _host,
+                )
             self._statuspage = StatusPageServer(self, bind=self._status_bind)
             try:
                 self._statuspage.start()
@@ -409,8 +419,8 @@ class MonitorEngine:
             await self._iroh.node().shutdown()
         try:
             self._history.close()
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[shutdown] history close error: {}", exc)
         logger.info("Engine stopped")
 
     # ------------------------------------------------------------------
@@ -428,79 +438,83 @@ class MonitorEngine:
         Skipped when the peer is inside a maintenance window — the probe
         round-trip would pollute history and a downed peer-during-maintenance
         shouldn't claim scheduler slots either.
+
+        Guarded by ``_probe_semaphore`` to cap concurrent outbound connections
+        and prevent resource exhaustion with many monitor targets.
         """
-        now = datetime.now(IST)
-        label = peer.entry.alias or peer.entry.node_id[:12]
+        async with self._probe_semaphore:
+            now = datetime.now(IST)
+            label = peer.entry.alias or peer.entry.node_id[:12]
 
-        trusted = self._trust.get_peer(peer.entry.node_id)
-        if trusted is not None and trusted.in_maintenance(now):
-            logger.debug(
-                "[probe] {} skipped (maintenance until {})",
-                label, trusted.maintenance_end,
-            )
-            return LatencyRecord(timestamp=now, rtt_ms=None, status=peer.current_status)
+            trusted = self._trust.get_peer(peer.entry.node_id)
+            if trusted is not None and trusted.in_maintenance(now):
+                logger.debug(
+                    "[probe] {} skipped (maintenance until {})",
+                    label, trusted.maintenance_end,
+                )
+                return LatencyRecord(timestamp=now, rtt_ms=None, status=peer.current_status)
 
-        conn = None
+            conn = None
 
-        try:
-            logger.debug("[probe] {} connecting (timeout={}s)", label, PROBE_TIMEOUT_SECONDS)
-            conn = await asyncio.wait_for(
-                self._iroh.node().endpoint().connect(
-                    peer.cached_node_addr, HEARTBEAT_ALPN
-                ),
-                timeout=PROBE_TIMEOUT_SECONDS,
-            )
-            rtt_us = conn.rtt()
-            rtt_ms = rtt_us / 1000.0 if rtt_us else None
+            try:
+                logger.debug("[probe] {} connecting (timeout={}s)", label, PROBE_TIMEOUT_SECONDS)
+                conn = await asyncio.wait_for(
+                    self._iroh.node().endpoint().connect(
+                        peer.cached_node_addr, HEARTBEAT_ALPN
+                    ),
+                    timeout=PROBE_TIMEOUT_SECONDS,
+                )
+                rtt_us = conn.rtt()
+                rtt_ms = rtt_us / 1000.0 if rtt_us else None
 
-            record = LatencyRecord(
-                timestamp=now, rtt_ms=rtt_ms, status=PeerStatus.ALIVE
-            )
-            peer.last_seen = now
-            peer.consecutive_failures = 0
-            peer.consecutive_successes += 1
-            peer.last_fail_reason = None
-            logger.debug(
-                "[probe] {} ok  rtt={:.2f}ms  successes={}",
-                label, rtt_ms or 0, peer.consecutive_successes,
-            )
+                record = LatencyRecord(
+                    timestamp=now, rtt_ms=rtt_ms, status=PeerStatus.ALIVE
+                )
+                peer.last_seen = now
+                peer.consecutive_failures = 0
+                peer.consecutive_successes += 1
+                peer.last_fail_reason = None
+                logger.debug(
+                    "[probe] {} ok  rtt={:.2f}ms  successes={}",
+                    label, rtt_ms or 0, peer.consecutive_successes,
+                )
 
-            await _log_conn_type(self._iroh.net(), peer.entry.node_id, label, "probe")
+                await _log_conn_type(self._iroh.net(), peer.entry.node_id, label, "probe")
 
-        except Exception as exc:
-            record = LatencyRecord(
-                timestamp=now, rtt_ms=None, status=PeerStatus.DEAD
-            )
-            peer.consecutive_failures += 1
-            peer.consecutive_successes = 0
-            msg = exc.message() if hasattr(exc, "message") else str(exc)
-            peer.last_fail_reason = f"{type(exc).__name__}: {msg}"[:200]
-            logger.warning(
-                "[probe] {} fail  failures={}/{}  reason={}: {}",
-                label,
-                peer.consecutive_failures,
-                self._down_after,
-                type(exc).__name__,
-                msg,
-            )
+            except Exception as exc:
+                record = LatencyRecord(
+                    timestamp=now, rtt_ms=None, status=PeerStatus.DEAD
+                )
+                peer.consecutive_failures += 1
+                peer.consecutive_successes = 0
+                msg = exc.message() if hasattr(exc, "message") else str(exc)
+                peer.last_fail_reason = f"{type(exc).__name__}: {msg}"[:200]
+                logger.warning(
+                    "[probe] {} fail  failures={}/{}  reason={}: {}",
+                    label,
+                    peer.consecutive_failures,
+                    self._down_after,
+                    type(exc).__name__,
+                    msg,
+                )
 
-        finally:
-            if conn is not None:
-                try:
-                    conn.close(0, b"heartbeat")
-                except Exception:
-                    pass
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close(0, b"heartbeat")
+                    except Exception:  # noqa: BLE001 S110
+                        pass  # best-effort conn cleanup
 
-        peer.latency_history.append(record)
-        try:
-            self._history.record(
-                peer.entry.node_id, record.timestamp, record.rtt_ms, record.status
-            )
-        except Exception as exc:
-            logger.warning("[probe] {} history write failed: {}", label, exc)
+            peer.latency_history.append(record)
+            try:
+                self._history.record(
+                    peer.entry.node_id, record.timestamp, record.rtt_ms, record.status
+                )
+            except Exception as exc:
+                logger.warning("[probe] {} history write failed: {}", label, exc)
 
-        await self._maybe_transition(peer, record, now)
-        return record
+            await self._maybe_transition(peer, record, now)
+            return record
 
     async def _maybe_transition(
         self, peer: PeerState, record: LatencyRecord, now: datetime
@@ -597,6 +611,28 @@ class MonitorEngine:
             logger.error("[transition] notifier failed: {}", exc)
 
     # ------------------------------------------------------------------
+    # History GC (offloaded to thread pool to avoid blocking the event loop)
+    # ------------------------------------------------------------------
+
+    async def _run_history_gc(self) -> None:
+        """Prune expired history rows and checkpoint WAL in a background thread."""
+        try:
+            deleted = await asyncio.to_thread(self._history.prune_older_than)
+            if deleted:
+                logger.info("[gc] pruned {} expired history rows", deleted)
+            # Checkpoint WAL to reclaim disk space and prevent unbounded WAL growth.
+            await asyncio.to_thread(self._history.checkpoint)
+        except Exception as exc:
+            logger.error("[gc] history prune failed: {}", exc)
+
+        # Prune _last_alert_fired of peers no longer in the trust store (revoked/removed).
+        stale = [nid for nid in self._last_alert_fired if nid not in self._devices]
+        for nid in stale:
+            del self._last_alert_fired[nid]
+        if stale:
+            logger.debug("[gc] pruned {} stale alert-fired entries", len(stale))
+
+    # ------------------------------------------------------------------
     # Push monitors (Slice D)
     # ------------------------------------------------------------------
 
@@ -682,8 +718,8 @@ class MonitorEngine:
             if conn is not None:
                 try:
                     conn.close(0, b"push done")
-                except Exception:
-                    pass
+                except Exception:  # noqa: BLE001 S110
+                    pass  # best-effort conn cleanup
 
     # ------------------------------------------------------------------
     # Cross-device dashboard fetch (Slice D)
@@ -721,8 +757,8 @@ class MonitorEngine:
         finally:
             try:
                 conn.close(0, b"done")
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001 S110
+                pass  # best-effort conn cleanup
 
     async def _run_heartbeat_cycle(self) -> None:
         """Probe all monitor targets concurrently and log a summary."""

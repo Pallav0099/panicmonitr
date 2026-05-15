@@ -16,6 +16,13 @@ dependencies = [
 [project.scripts]
 panic-monitor = "main:cli_main"
 
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.backends._legacy:_Backend"
+

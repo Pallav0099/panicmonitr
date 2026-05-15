@@ -893,7 +893,7 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                 if not node_id:
                     self._send_json({"error": "node_id required"}, status=400)
                     return
-                hours = int((q.get("hours") or ["24"])[0])
+                hours = min(int((q.get("hours") or ["24"])[0]), 720)  # cap at 30 days
                 rows = engine.history.recent_rows(node_id, hours=hours)
                 self._send_json(
                     [
@@ -911,8 +911,8 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             logger.error("[statuspage] handler error: {}", exc)
             try:
                 self.send_error(500, str(exc))
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001 S110
+                pass  # double-fault: error handler itself failed
 
 
 class StatusPageServer:
@@ -943,6 +943,8 @@ class StatusPageServer:
         BoundHandler.engine = engine
         try:
             self._server = http.server.ThreadingHTTPServer((host, port), BoundHandler)
+            self._server.request_queue_size = 8  # cap pending connections
+            self._server.timeout = 30  # drop idle connections after 30s
         except OSError as exc:
             logger.error("[statuspage] bind {}:{} failed: {}", host, port, exc)
             return

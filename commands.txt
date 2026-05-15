@@ -156,13 +156,6 @@ DAEMON / TUI RUNTIME
       Useful when you're behind strict NAT and peers can't probe you
       inbound; the push connection itself is the liveness signal.
 
-  --status-bind HOST:PORT                           NEW · D
-      HTTP status page bind address. Default: 127.0.0.1:8080.
-      Set to "" to disable the HTTP page entirely.
-
-  --push-to NODE_ID                                 NEW · D
-      Push heartbeats TO this peer (for behind-NAT setups). Repeatable.
-
 PATHS
 -----
   --identity PATH        Sealed secret key. Default: ./secret.key

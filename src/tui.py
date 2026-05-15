@@ -210,7 +210,7 @@ class AddPeerModal(ModalScreen[bool]):
 # Time parser (mirrors main.py _parse_time so the TUI is self-contained)
 # ------------------------------------------------------------------
 
-_REL_OFFSET_RE = _re.compile(r"^\\+(\\d+)([smhd])$")
+_REL_OFFSET_RE = _re.compile(r"^\+(\d+)([smhd])$")
 
 
 def _parse_time(value: str, anchor: datetime | None = None) -> datetime:
@@ -651,8 +651,8 @@ class MonitorApp(App):
     def _refresh_all(self) -> None:
         try:
             self._snapshot = build_dashboard_snapshot(self._engine)
-        except Exception:
-            self._snapshot = None
+        except Exception:  # noqa: BLE001
+            self._snapshot = None  # stats strip shows error state
         self._refresh_stats()
         self._refresh_table()
         self._refresh_detail()
@@ -928,8 +928,8 @@ class MonitorApp(App):
     def _fmt_rel(self, iso_ts: str) -> str:
         try:
             dt = datetime.fromisoformat(iso_ts)
-        except Exception:
-            return iso_ts
+        except Exception:  # noqa: BLE001
+            return iso_ts  # fallback: show raw timestamp string
         delta = datetime.now(IST) - dt
         total = int(delta.total_seconds())
         if total < 60:

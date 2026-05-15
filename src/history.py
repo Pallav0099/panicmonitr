@@ -80,8 +80,16 @@ class HistoryStore:
         with self._lock:
             try:
                 self._conn.close()
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001 S110
+                pass  # best-effort cleanup on close
+
+    def checkpoint(self) -> None:
+        """Force a WAL checkpoint to reclaim disk space."""
+        with self._lock:
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            except Exception:  # noqa: BLE001 S110
+                pass  # WAL checkpoint is best-effort
 
     # ------------------------------------------------------------------
     # Writes

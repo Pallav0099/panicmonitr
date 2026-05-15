@@ -154,8 +154,8 @@ class TrustLog:
         if self._own_node_id:
             try:
                 verify_key = nacl.signing.VerifyKey(bytes.fromhex(self._own_node_id))
-            except Exception:
-                verify_key = None
+            except Exception:  # noqa: BLE001 S110
+                verify_key = None  # malformed node_id; skip sig checks
 
         for entry in entries:
             if entry.seq != prev_seq + 1:
