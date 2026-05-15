@@ -1,0 +1,277 @@
+==============================================================================
+panic-monitor — command reference
+==============================================================================
+
+Invocation:
+    python main.py <mode> [options]
+
+A run is always in exactly one mode (mutually exclusive), plus any number of
+options. State files live in the current working directory.
+
+Slice tags (NEW · X) mark features landing in upcoming monitoring slices:
+  A = persistence + uptime %           (Slice A)
+  B = thresholds + webhook             (Slice B)
+  C = maintenance + tags + flap        (Slice C)
+  D = status page + push monitors      (Slice D)
+
+
+==============================================================================
+MODES (pick exactly one)
+==============================================================================
+
+IDENTITY
+--------
+  --init
+      First-run setup. Generates or seals secret.key under a password
+      (argon2id-sealed, >= 12 chars). Writes secret.key + secret.meta,
+      ensures log.jsonl has a genesis entry, ensures peers.json exists.
+      Re-running --init on an existing install verifies the password.
+
+  --show-identity
+      Print this device's NodeID. No password required (read from meta).
+
+  --reset-password
+      Re-seal the existing identity under a new password. Prompts for
+      current password, then new password (+ confirm). NodeID is unchanged.
+
+PEER MANAGEMENT
+---------------
+  --add-peer NODE_ID
+      Trust a peer by NodeID. Appends an add_peer op to log.jsonl, signed
+      by this device. Prompts for password.
+      Combine with: --alias NAME  --permissions CSV  --tags CSV (NEW · C)
+
+  --remove-peer NODE_ID
+  --revoke-peer NODE_ID
+      Revoke a peer. Appends a revoke_peer op to the log. Peer stays in
+      list-peers output with state=revoked. Prompts for password.
+
+  --list-peers
+      List trusted peers (no password required).
+      Combine with: --filter-tag TAG  (NEW · C)
+
+  --add-tag TARGET tag                              NEW · C
+  --remove-tag TARGET tag                           NEW · C
+  --set-tags TARGET t1,t2,t3                        NEW · C
+      Tag management. Appends a set_tags log op. Prompts for password.
+
+  --set-maintenance TARGET START END                NEW · C
+      Schedule a maintenance window on a peer. START/END are ISO timestamps
+      or relative offsets like "+0" / "+2h". Probes continue but
+      notifications are suppressed. Prompts for password.
+
+  --clear-maintenance TARGET                        NEW · C
+  --list-maintenance                                NEW · C
+
+INSPECTION (one-shot queries)
+-----------------------------
+  --uptime TARGET                                   NEW · A
+      Print uptime percentages for a peer (1h / 24h / 7d / 30d).
+      TARGET is an alias or 64-char hex NodeID. No password required.
+      Combine with: --window 1h|24h|7d|30d  (default: show all)
+
+  --history TARGET                                  NEW · A
+      Dump raw latency history for a peer (timestamp, rtt_ms, status).
+      Combine with: --hours N  (default: 24)
+
+  --test-webhook                                    NEW · B
+      Fire a test payload to --webhook-url and exit. Use before enabling
+      a live daemon.
+
+  --fetch-dashboard TARGET                          NEW · D
+      Pull a sibling peer's dashboard over the status ALPN. Requires the
+      peer to have granted you 'view_dashboard' permission. Prints the
+      returned JSON snapshot. Alias or NodeID both accepted.
+
+RUNTIME MODES
+-------------
+  --daemon
+      Run headless. Probes peers with monitor permission on the heartbeat
+      cycle. Serves inbound heartbeat protocol.
+
+  --tui
+      Launch the interactive TUI. Live dashboard, add-peer modal,
+      sparklines (Slice A), maintenance badges (Slice C).
+
+
+==============================================================================
+OPTIONS
+==============================================================================
+
+GENERAL
+-------
+  --debug
+      Enable DEBUG-level logging.
+
+  --alias NAME
+      Friendly name for --add-peer.
+
+  --permissions CSV
+      Comma-separated permissions for --add-peer. Default: monitor.
+      Valid: monitor, view_dashboard, chat, split, call, drop
+             (plus "*" wildcard)
+      view_dashboard: lets the peer pull your dashboard over the status
+                      ALPN. Grant to your own sibling devices only.
+      Example: --permissions monitor,view_dashboard
+
+  --tags CSV                                        NEW · C
+      Comma-separated tags for --add-peer.
+
+  --filter-tag TAG                                  NEW · C
+      Filter --list-peers output by tag.
+
+  --window WINDOW                                   NEW · A
+      Uptime window for --uptime. One of: 1h, 24h, 7d, 30d.
+
+  --hours N                                         NEW · A
+      History range for --history. Default: 24.
+
+DAEMON / TUI RUNTIME
+--------------------
+  --interval SEC
+      Probe period. Default: 30.
+
+  --webhook-url URL                                 NEW · B
+      Notifier target for monitor_up / monitor_down events. Use one of:
+      Discord, Slack, Telegram bot, ntfy, or generic HTTP endpoint.
+
+  --down-after N                                    NEW · B
+      Consecutive failed probes before declaring DEAD. Default: 3.
+
+  --up-after N                                      NEW · B
+      Consecutive successful probes before declaring ALIVE again.
+      Default: 1.
+
+  --flap-min-dwell SEC                              NEW · C
+      Minimum seconds in a state before re-firing the webhook. Default: 60.
+
+  --status-bind HOST:PORT                           NEW · D
+      HTTP dashboard bind address. Default: 127.0.0.1:8080. Purely local
+      UI — no peer traffic. Set to "" to disable the HTTP page entirely
+      (TUI still works). Cross-device dashboard sync goes over the
+      status ALPN (--fetch-dashboard), not HTTP.
+
+  --push-to NODE_ID                                 NEW · D
+      Push a heartbeat TO this peer every --interval seconds. Repeatable.
+      Useful when you're behind strict NAT and peers can't probe you
+      inbound; the push connection itself is the liveness signal.
+
+  --status-bind HOST:PORT                           NEW · D
+      HTTP status page bind address. Default: 127.0.0.1:8080.
+      Set to "" to disable the HTTP page entirely.
+
+  --push-to NODE_ID                                 NEW · D
+      Push heartbeats TO this peer (for behind-NAT setups). Repeatable.
+
+PATHS
+-----
+  --identity PATH        Sealed secret key. Default: ./secret.key
+  --identity-meta PATH   Argon2 params + NodeID. Default: ./secret.meta
+  --peers PATH           Materialized peer cache. Default: ./peers.json
+  --log-path PATH        Append-only trust log. Default: ./log.jsonl
+  --history-db PATH      SQLite history store (NEW · A). Default: ./history.db
+  --retain-days N        History retention (NEW · A). Default: 30
+
+MIGRATION
+---------
+  --force-fresh
+      During --init, wipe legacy account/mesh artifacts (account.key,
+      account.meta, device.cert, mesh.json) from the pre-flat-peer model.
+
+
+==============================================================================
+TUI KEYBINDINGS (inside --tui)
+==============================================================================
+
+  Main dashboard
+    q        quit
+    r        refresh
+    p        add peer
+    m        set maintenance on selected peer
+    t        edit tags on selected peer
+
+  Add-peer modal
+    enter    advance to next field / submit on last
+    esc      cancel
+
+  Set-maintenance modal
+    enter    submit
+    c        clear maintenance
+    esc      cancel
+
+  Edit-tags modal
+    enter    save
+    esc      cancel
+
+
+==============================================================================
+QUICK RECIPES
+==============================================================================
+
+  # 1) First-time setup on a new machine
+  python main.py --init
+  python main.py --show-identity
+
+  # 2) Trust another peer (monitor only)
+  python main.py --add-peer <NODE_ID> --alias bob --permissions monitor
+
+  # 3) Run the daemon with webhook alerts (Slice B)
+  python main.py --daemon \
+      --webhook-url https://ntfy.sh/my-topic \
+      --down-after 3 --up-after 2
+
+  # 4) Check uptime % for a peer (Slice A)
+  python main.py --uptime bob --window 24h
+
+  # 5) Dump recent latency history (Slice A)
+  python main.py --history bob --hours 6
+
+  # 6) Set a maintenance window (Slice C)
+  python main.py --set-maintenance bob "+0" "+2h"
+
+  # 7) Interactive dashboard
+  python main.py --tui
+
+  # 8) Custom state locations (e.g. test instances)
+  python main.py --tui \
+      --identity      ./state/secret.key \
+      --identity-meta ./state/secret.meta \
+      --peers         ./state/peers.json \
+      --log-path      ./state/log.jsonl \
+      --history-db    ./state/history.db
+
+  # 10) Rotate password (NodeID unchanged)
+  python main.py --reset-password
+
+
+==============================================================================
+ENVIRONMENT
+==============================================================================
+
+  PANIC_MONITOR_PASSWORD
+      If set, bypasses interactive prompts. Useful for systemd units,
+      tests, and CI. Leaks into process env — prefer interactive prompts
+      on shared hosts.
+
+
+==============================================================================
+NOTES
+==============================================================================
+
+  * Identity is one ed25519 seed. Its public half is the iroh NodeID. No
+    accounts, no device certificates, no CA. Trust is peer-to-peer.
+
+  * Every trust change is a signed, append-only entry in log.jsonl. The
+    chain (seq + prev_hash + sig) is verified on every load; tampering is
+    detectable.
+
+  * peers.json is a human-readable cache materialized from the log. The
+    log is authoritative; re-running any mutation rebuilds the cache.
+
+  * Peer-scoped config (permissions, tags, maintenance) lives in the log
+    because it describes a *relationship*. Machine-scoped config (webhook
+    URL, probe interval, retention) lives as CLI flags because it's
+    local to this device.
+
+  * The two test instances live at ../test/alice and ../test/bob. Each
+    has a ./run wrapper that execs this CLI with the project venv.

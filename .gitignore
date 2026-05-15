@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# Venv
+.venv/
+
+# Secrets & per-machine identity
+secret.key
+secret.meta
+
+# Trust log + materialized cache (per-machine)
+log.jsonl
+peers.json
+
+# Legacy artifacts (pre-flat-peer model) — still ignored so a stale tree
+# doesn't dirty the working copy.
+account.key
+account.meta
+device.cert
+mesh.json
+trusted_peers.json
+trusted_accounts.json
+
+# Logs
+*.log
+
+# Runtime databases (per-machine SQLite stores)
+*.db
+
+# Backup files
+*.bak
+
+# Local agent settings
+.claude/
+
+# IDE
+.vscode/
+.idea/

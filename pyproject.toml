@@ -1,0 +1,21 @@
+[project]
+name = "panic-monitor"
+version = "0.1.0"
+description = "P2P health monitoring daemon for the PanicLab ecosystem"
+requires-python = ">=3.12"
+dependencies = [
+    "iroh==0.35.0",
+    "pydantic>=2.0",
+    "textual>=0.40",
+    "loguru>=0.7",
+    "apscheduler>=3.10,<4.0",
+    "pynacl>=1.5",
+    "argon2-cffi>=23.1",
+]
+
+[project.scripts]
+panic-monitor = "main:cli_main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends._legacy:_Backend"
