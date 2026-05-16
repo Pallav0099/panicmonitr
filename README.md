@@ -2,11 +2,14 @@
 
 A zero-infrastructure, peer-to-peer health monitoring daemon. It replaces centralized uptime monitors with a flat-peer mesh, using Iroh for direct QUIC connections and append-only, cryptographically signed trust logs for access control.
 
+With v2, it features comprehensive system and container resource monitoring, local SQLite log stores, P2P gossip-based metric streaming, and offline gap handling.
+
 ## Prerequisites
 
 - Linux (tested on modern distributions)
 - Python 3.12+
 - Systemd (for daemon management)
+- Optional but recommended: Docker (for container stats)
 
 ## Installation
 
@@ -46,6 +49,13 @@ To allow a peer to pull your dashboard data:
 ```bash
 panic-monitor --add-peer <NODE_ID> --alias "ops-laptop" --permissions "view_dashboard"
 ```
+
+## Roles
+
+A node can operate in one of three roles, controlled by the `--role` flag (default: `both`):
+- `monitored`: Collects local system/container metrics and serves as the source of truth, storing data in a local log store.
+- `monitoring`: Consumes metrics from monitored peers to render the TUI and Web UI dashboards. Requests syncs to fill gaps if it goes offline.
+- `both`: Acts as both a monitored agent and a monitoring dashboard.
 
 ## Running the Daemon
 
@@ -95,17 +105,26 @@ panic-monitor --set-maintenance "api-server" +0 +2h
 
 ## TUI and Dashboard
 
-To interactively view the status of all monitored peers, use the Terminal UI:
+To interactively view the status of all monitored peers, use the btop-inspired Terminal UI:
 ```bash
 panic-monitor --tui
 ```
 
-The daemon also exposes a local-only HTTP dashboard for programmatic access. By default, it binds to `127.0.0.1:8080`.
+The daemon exposes a rich Flask + Plotly dashboard for interactive visualizations of CPU, Memory, Disk, Network, and Uptime over time. It handles network disconnects by distinguishing between offline gaps vs. true outages.
+By default, it binds to port `42069`.
 ```bash
-curl http://127.0.0.1:8080/status.json
+http://127.0.0.1:42069/
 ```
 
 To fetch a remote peer's dashboard over the P2P mesh (requires `view_dashboard` permission):
 ```bash
 panic-monitor --fetch-dashboard <NODE_ID>
 ```
+
+### Additional Configuration Flags
+
+- `--role {monitored,monitoring,both}`: Defines node behavior (default: `both`).
+- `--dashboard-port PORT`: Port for the Flask web dashboard (default: `42069`).
+- `--stats-interval SECS`: System stats collection interval in seconds (default: `10`).
+- `--logstore-db PATH`: Path to the server-side SQLite logstore DB.
+- `--no-docker`: Disables Docker container stats collection.
