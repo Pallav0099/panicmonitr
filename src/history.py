@@ -8,10 +8,10 @@ from pathlib import Path
 
 from loguru import logger
 
-from src import IST
+from src import IST, paths
 from src.schema import PeerStatus
 
-DEFAULT_HISTORY_PATH = Path("./history.db")
+DEFAULT_HISTORY_PATH = paths.default_history_path()
 DEFAULT_RETAIN_DAYS = 30
 
 _SCHEMA = """

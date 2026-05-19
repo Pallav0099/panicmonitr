@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -11,9 +13,9 @@ import nacl.signing
 from loguru import logger
 from pydantic import BaseModel
 
-from src import IST
+from src import IST, paths
 
-DEFAULT_LOG_PATH = Path("./log.jsonl")
+DEFAULT_LOG_PATH = paths.default_log_path()
 
 OP_GENESIS = "genesis"
 OP_ADD_PEER = "add_peer"
@@ -105,12 +107,23 @@ def _entry_hash(entry: LogEntry) -> str:
     ).hexdigest()
 
 
+# How many recent monitor events the dashboard tail-reads. Kept in a deque so
+# the status page can render in O(k) instead of scanning the whole log.
+_MONITOR_EVENT_TAIL = 256
+
+
 class TrustLog:
     """Append-only, signed log of trust operations.
 
     Each entry is signed by the device's own ed25519 secret key. The log chain
     is verified on load (sequence continuity + prev_hash linkage + signatures).
     The materialized peer view is derived by replaying the log.
+
+    Thread-safety: ``append`` and the readers that depend on chain consistency
+    (``head``, ``entries``, ``ops_since``, ``monitor_events``) are guarded by
+    ``self._lock``. The controlsock thread and the asyncio event loop both
+    write to this log, so without the lock two concurrent appends would race
+    on ``seq``/``prev_hash``, breaking chain verification on the next load.
     """
 
     def __init__(
@@ -124,6 +137,10 @@ class TrustLog:
         self._own_node_id = own_node_id
         self._entries: list[LogEntry] = []
         self._last_mtime: float = 0.0
+        self._lock = threading.RLock()
+        # O(1) tail of monitor_down/_up events for the dashboard, maintained
+        # incrementally by ``append`` / repopulated by ``load``.
+        self._monitor_tail: deque[LogEntry] = deque(maxlen=_MONITOR_EVENT_TAIL)
 
     def load(self) -> None:
         if not self._path.exists():
@@ -143,9 +160,18 @@ class TrustLog:
             entries.append(entry)
 
         self._verify_chain(entries)
-        self._entries = entries
-        self._last_mtime = self._path.stat().st_mtime
+        with self._lock:
+            self._entries = entries
+            self._last_mtime = self._path.stat().st_mtime
+            self._rebuild_monitor_tail()
         logger.info("Trust log loaded  entries={}", len(entries))
+
+    def _rebuild_monitor_tail(self) -> None:
+        """Re-seed the monitor-event tail from ``_entries`` (called on load)."""
+        self._monitor_tail.clear()
+        for e in self._entries:
+            if e.type in (OP_MONITOR_DOWN, OP_MONITOR_UP):
+                self._monitor_tail.append(e)
 
     def _verify_chain(self, entries: list[LogEntry]) -> None:
         prev_hash = ZERO_HASH
@@ -178,16 +204,19 @@ class TrustLog:
             prev_seq = entry.seq
 
     def head(self) -> tuple[int, str]:
-        if not self._entries:
-            return -1, ZERO_HASH
-        last = self._entries[-1]
-        return last.seq, _entry_hash(last)
+        with self._lock:
+            if not self._entries:
+                return -1, ZERO_HASH
+            last = self._entries[-1]
+            return last.seq, _entry_hash(last)
 
     def entries(self) -> list[LogEntry]:
-        return list(self._entries)
+        with self._lock:
+            return list(self._entries)
 
     def ops_since(self, seq: int) -> list[LogEntry]:
-        return [e for e in self._entries if e.seq > seq]
+        with self._lock:
+            return [e for e in self._entries if e.seq > seq]
 
     def append(self, type_: str, data: dict) -> LogEntry:
         if self._signing_key is None:
@@ -195,31 +224,34 @@ class TrustLog:
         if type_ not in OP_TYPES:
             raise ValueError(f"Unknown op type: {type_}")
 
-        if self._entries:
-            seq = self._entries[-1].seq + 1
-            prev_hash = _entry_hash(self._entries[-1])
-        else:
-            seq = 0
-            prev_hash = ZERO_HASH
+        with self._lock:
+            if self._entries:
+                seq = self._entries[-1].seq + 1
+                prev_hash = _entry_hash(self._entries[-1])
+            else:
+                seq = 0
+                prev_hash = ZERO_HASH
 
-        timestamp = datetime.now(IST).isoformat()
-        payload = _signing_payload(seq, type_, data, timestamp, prev_hash)
-        sig = self._signing_key.sign(payload).signature.hex()
+            timestamp = datetime.now(IST).isoformat()
+            payload = _signing_payload(seq, type_, data, timestamp, prev_hash)
+            sig = self._signing_key.sign(payload).signature.hex()
 
-        entry = LogEntry(
-            seq=seq,
-            type=type_,
-            data=data,
-            timestamp=timestamp,
-            prev_hash=prev_hash,
-            sig=sig,
-        )
-        self._entries.append(entry)
+            entry = LogEntry(
+                seq=seq,
+                type=type_,
+                data=data,
+                timestamp=timestamp,
+                prev_hash=prev_hash,
+                sig=sig,
+            )
+            self._entries.append(entry)
+            if type_ in (OP_MONITOR_DOWN, OP_MONITOR_UP):
+                self._monitor_tail.append(entry)
 
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        with self._path.open("a", encoding="utf-8") as f:
-            f.write(entry.model_dump_json() + "\n")
-        self._last_mtime = self._path.stat().st_mtime
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            with self._path.open("a", encoding="utf-8") as f:
+                f.write(entry.model_dump_json() + "\n")
+            self._last_mtime = self._path.stat().st_mtime
         logger.debug("[log.append] seq={} type={}", seq, type_)
         return entry
 
@@ -236,7 +268,9 @@ class TrustLog:
         Key = node_id. Value carries alias, permissions, added_at, revoked_at.
         """
         peers: dict[str, dict] = {}
-        for entry in self._entries:
+        with self._lock:
+            entries_snapshot = list(self._entries)
+        for entry in entries_snapshot:
             t = entry.type
             if t == OP_GENESIS:
                 continue
@@ -289,15 +323,16 @@ class TrustLog:
         return peer is not None and peer.get("revoked_at") is not None
 
     def monitor_events(self, node_id: str | None = None) -> list[LogEntry]:
-        """Return the monitor_down / monitor_up entries, optionally filtered by peer."""
-        out = []
-        for e in self._entries:
-            if e.type not in (OP_MONITOR_DOWN, OP_MONITOR_UP):
-                continue
-            if node_id is not None and e.data.get("node_id") != node_id:
-                continue
-            out.append(e)
-        return out
+        """Return the monitor_down / monitor_up entries, optionally filtered by peer.
+
+        Reads from the in-memory tail (O(_MONITOR_EVENT_TAIL)) rather than
+        scanning the full log on every dashboard refresh.
+        """
+        with self._lock:
+            tail = list(self._monitor_tail)
+        if node_id is None:
+            return tail
+        return [e for e in tail if e.data.get("node_id") == node_id]
 
     def reload_if_changed(self) -> bool:
         if not self._path.exists():
@@ -306,6 +341,8 @@ class TrustLog:
         if mtime <= self._last_mtime:
             return False
         logger.info("log.jsonl changed on disk -- reloading")
-        self._entries = []
+        with self._lock:
+            self._entries = []
+            self._monitor_tail.clear()
         self.load()
         return True

@@ -1,0 +1,47 @@
+[Unit]
+Description=Panic Monitor - P2P Health Monitoring Daemon
+After=network-online.target
+Wants=network-online.target
+
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+Type=simple
+{credential_directive}{password_env_directive}
+ExecStart={exec_start} --daemon \
+    --identity      {identity_path} \
+    --identity-meta {identity_meta_path} \
+    --peers         {peers_path} \
+    --log-path      {log_path} \
+    --history-db    {history_db} \
+    --logstore-db   {logstore_db} \
+    --password-from {password_backend}
+
+Environment=PANIC_MONITOR_CONFIG_DIR={config_dir}
+Environment=PANIC_MONITOR_DATA_DIR={data_dir}
+
+WorkingDirectory={working_dir}
+Restart=on-failure
+RestartSec=5
+WatchdogSec=90
+
+# Resource limits — generous enough for routine operation, tight enough to
+# cap a runaway leak before it can take down the host.
+MemoryHigh=180M
+MemoryMax=256M
+CPUQuota=50%
+Nice=10
+LimitNOFILE=512
+TasksMax=64
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+RestrictRealtime=yes
+ReadWritePaths={read_write_paths}
+{extra_hardening}
+
+[Install]
+WantedBy={wanted_by}

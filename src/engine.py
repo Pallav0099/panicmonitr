@@ -36,6 +36,7 @@ from src.schema import (
     PeerStatus,
     SyncStatus,
 )
+from src.controlsock import ControlSocketServer
 from src.stats import StatsCollector
 from src.statuspage import StatusPageServer, build_dashboard_snapshot
 from src.trust import PeerTrustManager
@@ -424,6 +425,19 @@ class MonitorEngine:
         self._signing_key: nacl.signing.SigningKey = nacl.signing.SigningKey(secret_key)
         self.shutdown_event: asyncio.Event = asyncio.Event()
         self._probe_semaphore: asyncio.Semaphore = asyncio.Semaphore(MAX_CONCURRENT_PROBES)
+        self._sync_semaphore: asyncio.Semaphore = asyncio.Semaphore(5)
+        self._dashboard_pull_semaphore: asyncio.Semaphore = asyncio.Semaphore(10)
+        self._controlsock: ControlSocketServer | None = None
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self._started_at: datetime | None = None
+        # Background tasks spawned via ``asyncio.create_task`` that need to be
+        # drained on shutdown — otherwise they can outlive the iroh node /
+        # history close and hit use-after-close errors.
+        self._bg_tasks: set[asyncio.Task] = set()
+        # In-memory cache of the most recently recorded container list, used
+        # by ``_check_container_events`` to detect transitions without a
+        # round-trip to SQLite on every 10-second stats tick.
+        self._prev_containers_by_name: dict[str, dict] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -432,6 +446,8 @@ class MonitorEngine:
     async def init(self) -> None:
         """Bring up the iroh node, load monitor targets, and start the scheduler."""
         logger.debug("[init] setting uniffi event loop")
+        self.loop = asyncio.get_running_loop()
+        self._started_at = datetime.now(IST)
         iroh.iroh_ffi.uniffi_set_event_loop(asyncio.get_running_loop())
 
         logger.debug("[init] node_id={}", self._node_id_str[:16])
@@ -442,7 +458,7 @@ class MonitorEngine:
             self._stats_collector = StatsCollector(include_docker=self._include_docker)
             from src.logstore import DEFAULT_LOGSTORE_PATH
             ls_path = self._logstore_path or DEFAULT_LOGSTORE_PATH
-            self._logstore = LogStore(ls_path)
+            self._logstore = LogStore(ls_path, own_node_id=self._node_id_str)
             self._logstore.record_event(EV_AGENT_STARTED, {"node_id": self._node_id_str})
             logger.info("[init] stats collector + logstore ready (role={})", self._role.value)
 
@@ -521,6 +537,18 @@ class MonitorEngine:
                 [t[:12] for t in self._push_to_targets],
             )
 
+        # Cross-device live stats pull (monitoring role).
+        # Only nodes that consume dashboards run the pull; pure monitored skips.
+        is_monitoring = self._role in (NodeRole.MONITORING, NodeRole.BOTH)
+        if is_monitoring:
+            self._scheduler.add_job(
+                self._run_peer_dashboard_pull,
+                trigger="interval",
+                seconds=self._stats_interval,
+                id="peer_dashboard_pull",
+                name="Peer dashboard pull",
+            )
+
         # Stats collection + gossip broadcast (monitored role)
         if is_monitored and self._stats_collector is not None:
             self._scheduler.add_job(
@@ -574,6 +602,18 @@ class MonitorEngine:
                 logger.error("[init] status page startup failed: {}", exc)
                 self._statuspage = None
 
+        # Startup-time gap fill: one background sync per peer with monitor perms.
+        # Bounded by self._sync_semaphore so a long-offline node can't swamp us.
+        self._spawn_bg(self._startup_sync_all())
+
+        # Local admin socket — CLI talks to the running daemon here.
+        try:
+            self._controlsock = ControlSocketServer(self)
+            self._controlsock.start()
+        except Exception as exc:
+            logger.error("[init] control socket startup failed: {}", exc)
+            self._controlsock = None
+
         # Flask + Plotly web dashboard
         if self._dashboard_port:
             try:
@@ -590,6 +630,19 @@ class MonitorEngine:
 
         logger.info("Engine ready  role={}  interval={}s", self._role.value, self._interval)
 
+    def _spawn_bg(self, coro) -> asyncio.Task:
+        """Run a coroutine as a background task tracked by the engine.
+
+        Always go through this helper instead of bare ``asyncio.create_task``
+        so the task is rooted (won't be GC'd mid-flight, won't swallow
+        exceptions silently) and ``shutdown`` can await it before closing
+        iroh / history / logstore.
+        """
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
+
     async def shutdown(self) -> None:
         """Gracefully tear down the scheduler and iroh node."""
         logger.info("Shutting down engine ...")
@@ -601,16 +654,32 @@ class MonitorEngine:
                 logger.debug("[shutdown] logstore event record error: {}", exc)
         if self._scheduler and self._scheduler.running:
             self._scheduler.shutdown(wait=True)
-        if self._statuspage is not None:
-            try:
-                self._statuspage.stop()
-            except Exception as exc:
-                logger.debug("[shutdown] status page stop error: {}", exc)
+        # Drain HTTP servers first — their handler threads use history/logstore.
+        # If we close stores before stopping the servers, in-flight requests
+        # hit a closed sqlite connection.
         if self._webapp is not None:
             try:
                 self._webapp.stop()
             except Exception as exc:
                 logger.debug("[shutdown] webapp stop error: {}", exc)
+        if self._statuspage is not None:
+            try:
+                self._statuspage.stop()
+            except Exception as exc:
+                logger.debug("[shutdown] status page stop error: {}", exc)
+        if self._controlsock is not None:
+            try:
+                self._controlsock.stop()
+            except Exception as exc:
+                logger.debug("[shutdown] control socket stop error: {}", exc)
+        # Drain background asyncio tasks before closing iroh / history. A
+        # `_startup_sync_all` or `_maybe_schedule_reconnect_sync` task still
+        # in-flight here would otherwise hit a closed iroh node / logstore.
+        if self._bg_tasks:
+            pending = list(self._bg_tasks)
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
         if self._iroh:
             await self._iroh.node().shutdown()
         try:
@@ -640,82 +709,84 @@ class MonitorEngine:
         round-trip would pollute history and a downed peer-during-maintenance
         shouldn't claim scheduler slots either.
 
-        Guarded by ``_probe_semaphore`` to cap concurrent outbound connections
-        and prevent resource exhaustion with many monitor targets.
+        Only the outbound iroh connect is wrapped in ``_probe_semaphore``; the
+        maintenance-skip fast path, history write, and transition bookkeeping
+        run outside the cap so a fully-booked semaphore doesn't serialize
+        cheap work behind connect timeouts.
         """
-        async with self._probe_semaphore:
-            now = datetime.now(IST)
-            label = peer.entry.alias or peer.entry.node_id[:12]
+        now = datetime.now(IST)
+        label = peer.entry.alias or peer.entry.node_id[:12]
 
-            trusted = self._trust.get_peer(peer.entry.node_id)
-            if trusted is not None and trusted.in_maintenance(now):
-                logger.debug(
-                    "[probe] {} skipped (maintenance until {})",
-                    label, trusted.maintenance_end,
-                )
-                return LatencyRecord(timestamp=now, rtt_ms=None, status=peer.current_status)
+        trusted = self._trust.get_peer(peer.entry.node_id)
+        if trusted is not None and trusted.in_maintenance(now):
+            logger.debug(
+                "[probe] {} skipped (maintenance until {})",
+                label, trusted.maintenance_end,
+            )
+            return LatencyRecord(timestamp=now, rtt_ms=None, status=peer.current_status)
 
-            conn = None
+        conn = None
 
-            try:
-                logger.debug("[probe] {} connecting (timeout={}s)", label, PROBE_TIMEOUT_SECONDS)
+        try:
+            logger.debug("[probe] {} connecting (timeout={}s)", label, PROBE_TIMEOUT_SECONDS)
+            async with self._probe_semaphore:
                 conn = await asyncio.wait_for(
                     self._iroh.node().endpoint().connect(
                         peer.cached_node_addr, HEARTBEAT_ALPN
                     ),
                     timeout=PROBE_TIMEOUT_SECONDS,
                 )
-                rtt_us = conn.rtt()
-                rtt_ms = rtt_us / 1000.0 if rtt_us else None
+            rtt_us = conn.rtt()
+            rtt_ms = rtt_us / 1000.0 if rtt_us else None
 
-                record = LatencyRecord(
-                    timestamp=now, rtt_ms=rtt_ms, status=PeerStatus.ALIVE
-                )
-                peer.last_seen = now
-                peer.consecutive_failures = 0
-                peer.consecutive_successes += 1
-                peer.last_fail_reason = None
-                logger.debug(
-                    "[probe] {} ok  rtt={:.2f}ms  successes={}",
-                    label, rtt_ms or 0, peer.consecutive_successes,
-                )
+            record = LatencyRecord(
+                timestamp=now, rtt_ms=rtt_ms, status=PeerStatus.ALIVE
+            )
+            peer.last_seen = now
+            peer.consecutive_failures = 0
+            peer.consecutive_successes += 1
+            peer.last_fail_reason = None
+            logger.debug(
+                "[probe] {} ok  rtt={:.2f}ms  successes={}",
+                label, rtt_ms or 0, peer.consecutive_successes,
+            )
 
-                await _log_conn_type(self._iroh.net(), peer.entry.node_id, label, "probe")
+            await _log_conn_type(self._iroh.net(), peer.entry.node_id, label, "probe")
 
-            except Exception as exc:
-                record = LatencyRecord(
-                    timestamp=now, rtt_ms=None, status=PeerStatus.DEAD
-                )
-                peer.consecutive_failures += 1
-                peer.consecutive_successes = 0
-                msg = exc.message() if hasattr(exc, "message") else str(exc)
-                peer.last_fail_reason = f"{type(exc).__name__}: {msg}"[:200]
-                logger.warning(
-                    "[probe] {} fail  failures={}/{}  reason={}: {}",
-                    label,
-                    peer.consecutive_failures,
-                    self._down_after,
-                    type(exc).__name__,
-                    msg,
-                )
+        except Exception as exc:
+            record = LatencyRecord(
+                timestamp=now, rtt_ms=None, status=PeerStatus.DEAD
+            )
+            peer.consecutive_failures += 1
+            peer.consecutive_successes = 0
+            msg = exc.message() if hasattr(exc, "message") else str(exc)
+            peer.last_fail_reason = f"{type(exc).__name__}: {msg}"[:200]
+            logger.warning(
+                "[probe] {} fail  failures={}/{}  reason={}: {}",
+                label,
+                peer.consecutive_failures,
+                self._down_after,
+                type(exc).__name__,
+                msg,
+            )
 
-            finally:
-                if conn is not None:
-                    try:
-                        conn.close(0, b"heartbeat")
-                    except Exception:  # noqa: BLE001 S110
-                        pass  # best-effort conn cleanup
+        finally:
+            if conn is not None:
+                try:
+                    conn.close(0, b"heartbeat")
+                except Exception:  # noqa: BLE001 S110
+                    pass  # best-effort conn cleanup
 
-            peer.latency_history.append(record)
-            try:
-                self._history.record(
-                    peer.entry.node_id, record.timestamp, record.rtt_ms, record.status
-                )
-            except Exception as exc:
-                logger.warning("[probe] {} history write failed: {}", label, exc)
+        peer.latency_history.append(record)
+        try:
+            self._history.record(
+                peer.entry.node_id, record.timestamp, record.rtt_ms, record.status
+            )
+        except Exception as exc:
+            logger.warning("[probe] {} history write failed: {}", label, exc)
 
-            await self._maybe_transition(peer, record, now)
-            return record
+        await self._maybe_transition(peer, record, now)
+        return record
 
     async def _maybe_transition(
         self, peer: PeerState, record: LatencyRecord, now: datetime
@@ -747,6 +818,11 @@ class MonitorEngine:
             label, prev.value, new_state.value,
             peer.consecutive_failures, peer.consecutive_successes,
         )
+
+        if new_state == PeerStatus.ALIVE and prev == PeerStatus.DEAD:
+            # We just reconnected. If the gap is long enough to suggest
+            # missed data, schedule a sync to fill it.
+            self._spawn_bg(self._maybe_schedule_reconnect_sync(peer, now))
 
         if prev == PeerStatus.UNKNOWN:
             # Don't page for the first-observation transition; it's noise, not a change.
@@ -860,47 +936,59 @@ class MonitorEngine:
             logger.error("[stats_cycle] failed: {}", exc)
 
     async def _check_container_events(self, new_containers: list[dict]) -> None:
-        """Compare new container list against previous to detect state changes."""
+        """Compare new container list against previous to detect state changes.
+
+        Uses ``self._prev_containers_by_name`` (updated in-process every tick)
+        instead of re-SELECTing the latest snapshot from SQLite — the prior
+        state is what we just wrote, so a memory hand-off is sufficient and
+        eliminates a synchronous DB read on the 10-second stats loop.
+        """
         if self._logstore is None:
             return
-        # Get previously known containers from latest snapshot in logstore
+        prev_by_name = self._prev_containers_by_name
         try:
-            prev_snap = await asyncio.to_thread(self._logstore.latest_snapshot)
-        except Exception:
-            return
-        if prev_snap is None:
-            return
+            if not prev_by_name:
+                # Cold start: seed from disk so the first post-restart tick
+                # doesn't lose its baseline.
+                prev_snap = await asyncio.to_thread(self._logstore.latest_snapshot)
+                if prev_snap is not None:
+                    prev_by_name = {
+                        c["name"]: c for c in prev_snap.get("containers", [])
+                    }
 
-        prev_by_name: dict[str, dict] = {
-            c["name"]: c for c in prev_snap.get("containers", [])
-        }
-        for c in new_containers:
-            name = c.get("name", "")
-            prev = prev_by_name.get(name)
-            if prev is None:
-                continue
-            prev_status = prev.get("status")
-            curr_status = c.get("status")
-            if prev_status == "running" and curr_status == "exited":
-                await asyncio.to_thread(
-                    self._logstore.record_event,
-                    EV_CONTAINER_EXITED,
-                    {"name": name, "image": c.get("image")},
-                )
-            elif prev_status in ("exited", "stopped") and curr_status == "running":
-                await asyncio.to_thread(
-                    self._logstore.record_event,
-                    EV_CONTAINER_RESTARTED,
-                    {"name": name, "image": c.get("image")},
-                )
-            curr_health = c.get("health")
-            prev_health = prev.get("health")
-            if curr_health == "unhealthy" and prev_health != "unhealthy":
-                await asyncio.to_thread(
-                    self._logstore.record_event,
-                    EV_CONTAINER_UNHEALTHY,
-                    {"name": name, "image": c.get("image")},
-                )
+            for c in new_containers:
+                name = c.get("name", "")
+                prev = prev_by_name.get(name)
+                if prev is None:
+                    continue
+                prev_status = prev.get("status")
+                curr_status = c.get("status")
+                if prev_status == "running" and curr_status == "exited":
+                    await asyncio.to_thread(
+                        self._logstore.record_event,
+                        EV_CONTAINER_EXITED,
+                        {"name": name, "image": c.get("image")},
+                    )
+                elif prev_status in ("exited", "stopped") and curr_status == "running":
+                    await asyncio.to_thread(
+                        self._logstore.record_event,
+                        EV_CONTAINER_RESTARTED,
+                        {"name": name, "image": c.get("image")},
+                    )
+                curr_health = c.get("health")
+                prev_health = prev.get("health")
+                if curr_health == "unhealthy" and prev_health != "unhealthy":
+                    await asyncio.to_thread(
+                        self._logstore.record_event,
+                        EV_CONTAINER_UNHEALTHY,
+                        {"name": name, "image": c.get("image")},
+                    )
+        finally:
+            # Always update the cache so the next tick has fresh prior state,
+            # even if a transition write failed mid-loop.
+            self._prev_containers_by_name = {
+                c.get("name", ""): c for c in new_containers if c.get("name")
+            }
 
     async def _broadcast_stats(self, snap: dict) -> None:
         """Broadcast a stats snapshot message via iroh-gossip.
@@ -926,6 +1014,63 @@ class MonitorEngine:
                         snap.get("cpu_percent"), snap.get("mem_percent"))
         except Exception as exc:
             logger.debug("[stats] broadcast skipped: {}", exc)
+
+    async def _run_peer_dashboard_pull(self) -> None:
+        """Pull each peer's dashboard snapshot over STATUS_ALPN and merge.
+
+        Only targets peers from whom we hold ``view_dashboard``. The snapshot
+        carries ``own_stats`` + ``own_stats_history`` which we merge into
+        ``PeerState.last_stats`` / ``stats_history`` for the live UI, and
+        into ``LogStore`` keyed by the peer's node_id for history queries.
+        """
+        if self._iroh is None:
+            return
+        peers = self._trust.peers_with_permission("view_dashboard")
+        if not peers:
+            return
+        tasks = [self._pull_one_peer_dashboard(p.node_id) for p in peers]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _pull_one_peer_dashboard(self, node_id: str) -> None:
+        # Bound concurrent dashboard pulls — without this the 10-second
+        # scheduler tick fans out one iroh connect per peer with view_dashboard
+        # permission, spiking outbound socket pressure with large peer counts.
+        async with self._dashboard_pull_semaphore:
+            await self._pull_one_peer_dashboard_inner(node_id)
+
+    async def _pull_one_peer_dashboard_inner(self, node_id: str) -> None:
+        try:
+            snap = await self.fetch_peer_dashboard(node_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[stats-pull] {} skipped: {}", node_id[:12], exc)
+            return
+
+        own_stats = snap.get("own_stats")
+        own_history = snap.get("own_stats_history") or []
+
+        state = self._devices.get(node_id)
+        if state is not None:
+            if own_stats is not None:
+                state.last_stats = own_stats
+                state.stats_history.append(own_stats)
+            if state.has_dashboard_gap:
+                state.has_dashboard_gap = False
+
+        if self._logstore is None or own_stats is None:
+            return
+        # Mirror the latest snapshot into our logstore, keyed by the peer.
+        # merge_sync_payload uses (peer_node_id, ts) idempotency, so we
+        # stamp the snapshot with the time we received it.
+        stamped = dict(own_stats)
+        stamped.setdefault("ts", datetime.now(IST).isoformat())
+        try:
+            await asyncio.to_thread(
+                self._logstore.merge_sync_payload,
+                node_id,
+                {"raw_snapshots": [stamped], "events": [], "sync_strategy": "live"},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[stats-pull] {} merge failed: {}", node_id[:12], exc)
 
     async def _run_logstore_rollup(self) -> None:
         """Roll up raw snapshots into 5-min buckets."""
@@ -970,6 +1115,13 @@ class MonitorEngine:
     def role(self) -> NodeRole:
         return self._role
 
+    @property
+    def stats_collector(self) -> Optional[StatsCollector]:
+        """Public accessor — used by the webapp's `/api/container/<id>/logs`
+        endpoint to reach the live docker client without holding its own
+        reference."""
+        return self._stats_collector
+
     def get_own_stats(self) -> Optional[dict]:
         """Return the latest collected stats snapshot (own node)."""
         if self._logstore is None:
@@ -982,6 +1134,53 @@ class MonitorEngine:
     # ------------------------------------------------------------------
     # Push monitors (Slice D)
     # ------------------------------------------------------------------
+
+    async def _startup_sync_all(self) -> None:
+        """Background gap-fill at startup. Best-effort: errors are logged but
+        don't block the daemon from coming up. Skips when no logstore is
+        available (e.g., pure ``monitoring`` role configurations).
+
+        Peers are synced in parallel; ``self._sync_semaphore`` already caps
+        concurrency, so the loop doesn't need to serialize itself.
+        """
+        if self._logstore is None:
+            return
+        node_ids = list(self._devices.keys())
+        if not node_ids:
+            return
+
+        async def _one(nid: str) -> None:
+            try:
+                await self.sync_peer(nid)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[sync.startup] {} skipped: {}", nid[:12], exc)
+
+        await asyncio.gather(*(_one(nid) for nid in node_ids))
+
+    async def _maybe_schedule_reconnect_sync(
+        self, peer: PeerState, now: datetime
+    ) -> None:
+        """Trigger a gap-fill when a peer transitions ALIVE after a long absence.
+
+        Session-relative: compares to ``last_seen``. A brief blip doesn't
+        warrant a sync; a multi-interval absence does.
+        """
+        if self._logstore is None:
+            return
+        last_seen = peer.last_seen
+        if last_seen is None:
+            return
+        gap = (now - last_seen).total_seconds()
+        if gap < 5 * max(1, self._interval):
+            return
+        peer.sync_status = SyncStatus.GAP
+        peer.has_dashboard_gap = True
+        try:
+            peer.sync_status = SyncStatus.SYNCING
+            await self.sync_peer(peer.entry.node_id)
+        except Exception as exc:  # noqa: BLE001
+            peer.sync_status = SyncStatus.GAP
+            logger.warning("[sync.reconnect] {} failed: {}", peer.entry.node_id[:12], exc)
 
     async def _record_push_from(self, remote_node_id: str) -> None:
         """Record an inbound push as a successful liveness probe for *remote*.
@@ -1072,6 +1271,78 @@ class MonitorEngine:
     # Cross-device dashboard fetch (Slice D)
     # ------------------------------------------------------------------
 
+    async def sync_peer(self, target: str, since: datetime | None = None) -> dict:
+        """Pull historical data from *target* over SYNC_ALPN and merge it.
+
+        Mirrors fetch_peer_dashboard: resolves the target, opens a bi-stream,
+        writes a SyncRequest, reads the response, and feeds it into the local
+        LogStore keyed by the peer's node_id.
+        """
+        if self._iroh is None:
+            raise RuntimeError("engine not initialized")
+        if self._logstore is None:
+            raise RuntimeError("logstore not initialized (set --role to include monitored)")
+
+        target_node_id, err = self._trust.resolve_target(target)
+        if err is not None:
+            raise ValueError(err)
+        assert target_node_id is not None
+
+        cursor = since
+        if cursor is None:
+            cursor = self._logstore.last_seen_for_peer(target_node_id)
+        if cursor is None:
+            cursor = datetime.fromtimestamp(0, tz=IST)
+
+        try:
+            pub_key = iroh.PublicKey.from_string(target_node_id)
+        except iroh.iroh_ffi.IrohError as exc:
+            raise ValueError(f"invalid node_id: {exc}")
+
+        addr = iroh.NodeAddr(pub_key, None, [])
+        endpoint = self._iroh.node().endpoint()
+
+        async with self._sync_semaphore:
+            conn = await asyncio.wait_for(
+                endpoint.connect(addr, SYNC_ALPN), timeout=FETCH_TIMEOUT_SECONDS
+            )
+            try:
+                bi = await asyncio.wait_for(conn.open_bi(), timeout=FETCH_TIMEOUT_SECONDS)
+                send_stream = bi.send()
+                recv_stream = bi.recv()
+                request_body = json.dumps(
+                    {"last_seen_timestamp": cursor.isoformat()}
+                ).encode("utf-8")
+                await _write_framed(send_stream, request_body)
+                await send_stream.finish()
+                payload_bytes = await asyncio.wait_for(
+                    _read_framed(recv_stream, SYNC_RESPONSE_MAX),
+                    timeout=FETCH_TIMEOUT_SECONDS,
+                )
+            finally:
+                try:
+                    conn.close(0, b"sync done")
+                except Exception:  # noqa: BLE001 S110
+                    pass
+
+        payload = json.loads(payload_bytes.decode("utf-8"))
+        result = self._logstore.merge_sync_payload(target_node_id, payload)
+
+        state = self._devices.get(target_node_id)
+        if state is not None:
+            state.sync_status = SyncStatus.SYNCED
+            state.last_sync_ts = datetime.now(IST)
+            state.has_dashboard_gap = False
+
+        logger.info(
+            "[sync] {} merged snapshots={} events={} strategy={}",
+            target_node_id[:12],
+            result["snapshots_merged"],
+            result["events_merged"],
+            result["strategy"],
+        )
+        return result
+
     async def fetch_peer_dashboard(self, target: str) -> dict:
         """Pull the status dashboard from a peer we granted ``view_dashboard``.
 
@@ -1159,6 +1430,7 @@ class MonitorEngine:
         node_id: str,
         alias: str | None,
         permissions: list[str],
+        tags: list[str] | None = None,
     ) -> str | None:
         """Add a peer to the trust store. Returns an error string or None."""
         logger.debug(
@@ -1179,11 +1451,10 @@ class MonitorEngine:
             logger.debug("[add_peer] PublicKey.from_string failed for {}", node_id[:12])
             return "Invalid Node ID"
 
-        if not self._trust.add_peer(node_id, alias, permissions):
+        if not self._trust.add_peer(node_id, alias, permissions, tags):
             return "Peer already trusted (or invalid permissions)"
 
-        self._devices = self._load_devices()
-        logger.debug("[add_peer] reloaded monitor targets, count={}", len(self._devices))
+        self._request_devices_reload()
         return None
 
     def revoke_peer(self, node_id: str) -> str | None:
@@ -1191,7 +1462,53 @@ class MonitorEngine:
             return "Node ID must be 64-char lowercase hex"
         if not self._trust.revoke_peer(node_id):
             return "Peer not found or already revoked"
-        self._devices = self._load_devices()
+        self._request_devices_reload()
+        return None
+
+    def update_peer_permissions(self, node_id: str, permissions: list[str]) -> str | None:
+        if not validate_node_id(node_id):
+            return "Node ID must be 64-char lowercase hex"
+        if not self._trust.update_permissions(node_id, list(permissions)):
+            return "Failed to update permissions (peer missing, revoked, or invalid perms)"
+        self._request_devices_reload()
+        return None
+
+    def set_peer_tags(self, node_id: str, tags: list[str]) -> str | None:
+        if not validate_node_id(node_id):
+            return "Node ID must be 64-char lowercase hex"
+        if not self._trust.set_tags(node_id, list(tags)):
+            return "Failed to set tags"
+        self._request_devices_reload()
+        return None
+
+    def add_peer_tag(self, node_id: str, tag: str) -> str | None:
+        if not validate_node_id(node_id):
+            return "Node ID must be 64-char lowercase hex"
+        if not self._trust.add_tag(node_id, tag):
+            return "Failed to add tag"
+        return None
+
+    def remove_peer_tag(self, node_id: str, tag: str) -> str | None:
+        if not validate_node_id(node_id):
+            return "Node ID must be 64-char lowercase hex"
+        if not self._trust.remove_tag(node_id, tag):
+            return "Failed to remove tag"
+        return None
+
+    def set_peer_maintenance(self, node_id: str, start: datetime, end: datetime) -> str | None:
+        if not validate_node_id(node_id):
+            return "Node ID must be 64-char lowercase hex"
+        if end <= start:
+            return "Maintenance end must be after start"
+        if not self._trust.set_maintenance(node_id, start, end):
+            return "Failed to schedule maintenance"
+        return None
+
+    def clear_peer_maintenance(self, node_id: str) -> str | None:
+        if not validate_node_id(node_id):
+            return "Node ID must be 64-char lowercase hex"
+        if not self._trust.clear_maintenance(node_id):
+            return "Peer not found"
         return None
 
     def get_device_states(self) -> list[PeerState]:
@@ -1201,6 +1518,25 @@ class MonitorEngine:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _request_devices_reload(self) -> None:
+        """Schedule a `_devices` reload onto the engine event loop.
+
+        Called from the controlsock thread after a trust mutation. Routing
+        through ``call_soon_threadsafe`` ensures the loop is the single
+        owner of `self._devices`, so heartbeat iteration and reload can't
+        interleave (which would orphan in-flight ``PeerState`` counters).
+        """
+        if self.loop is None or not self.loop.is_running():
+            # Daemon not fully up, or already shutting down — direct write is
+            # safe in those phases (no concurrent heartbeat cycle running).
+            self._devices = self._load_devices()
+            return
+        self.loop.call_soon_threadsafe(self._apply_devices_reload)
+
+    def _apply_devices_reload(self) -> None:
+        self._devices = self._load_devices()
+        logger.debug("[reload] devices applied, count={}", len(self._devices))
 
     def _load_devices(self) -> dict[str, PeerState]:
         """Monitor dashboard = non-revoked peers we granted the 'monitor' permission to."""

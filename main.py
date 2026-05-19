@@ -14,10 +14,10 @@ from loguru import logger
 import re as _re
 from datetime import datetime, timedelta
 
-from src import IST
+from src import IST, paths
+from src import control_client
 from src.engine import MonitorEngine
 from src.history import (
-    DEFAULT_HISTORY_PATH,
     DEFAULT_RETAIN_DAYS,
     DEFAULT_WINDOWS,
     HistoryStore,
@@ -35,7 +35,6 @@ from src.identity import (
     validate_node_id,
 )
 from src.log import TrustLog
-from src.logstore import DEFAULT_LOGSTORE_PATH
 from src.notifier import WebhookNotifier, build_notifier, sample_event
 from src.schema import NodeRole
 from src.trust import PeerTrustManager
@@ -117,17 +116,22 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument("--daemon", action="store_true", help="Run headless daemon")
     mode.add_argument("--tui", action="store_true", help="Launch interactive TUI")
 
+    mode.add_argument("--install-service", action="store_true", help="Render and install the systemd unit (user mode by default, system mode if run as root)")
+    mode.add_argument("--uninstall-service", action="store_true", help="Disable and remove the systemd unit")
+    mode.add_argument("--migrate", action="store_true", help="Copy state files from legacy locations (CWD, /etc, /var/lib) into XDG paths")
+    mode.add_argument("--rotate-credential", action="store_true", help="Re-encrypt the stored credential under the current backend (does not touch the seed)")
+
     parser.add_argument("--debug", action="store_true", help="Enable DEBUG-level logging (default: INFO)")
     parser.add_argument("--alias", type=str, default=None, help="Friendly name for --add-peer")
     parser.add_argument("--permissions", type=str, default="monitor", help="Comma-separated permissions for --add-peer: monitor,view_dashboard,chat,split,call,drop")
     parser.add_argument("--tags", type=str, default=None, help="Comma-separated tags for --add-peer")
     parser.add_argument("--filter-tag", type=str, default=None, help="Filter --list-peers by tag")
     parser.add_argument("--interval", type=int, default=30, help="Heartbeat interval in seconds (default: 30)")
-    parser.add_argument("--peers", type=Path, default=Path("./peers.json"), help="Path to peers.json (materialized cache)")
-    parser.add_argument("--log-path", type=Path, default=Path("./log.jsonl"), help="Path to the append-only trust log")
-    parser.add_argument("--identity", type=Path, default=Path("./secret.key"), help="Path to device secret key (sealed ciphertext)")
-    parser.add_argument("--identity-meta", type=Path, default=Path("./secret.meta"), help="Path to identity metadata (salt + NodeID)")
-    parser.add_argument("--history-db", type=Path, default=DEFAULT_HISTORY_PATH, help="Path to SQLite latency history store")
+    parser.add_argument("--peers", type=Path, default=paths.default_peers_path(), help="Path to peers.json (materialized cache)")
+    parser.add_argument("--log-path", type=Path, default=paths.default_log_path(), help="Path to the append-only trust log")
+    parser.add_argument("--identity", type=Path, default=paths.default_identity_path(), help="Path to device secret key (sealed ciphertext)")
+    parser.add_argument("--identity-meta", type=Path, default=paths.default_meta_path(), help="Path to identity metadata (salt + NodeID)")
+    parser.add_argument("--history-db", type=Path, default=paths.default_history_path(), help="Path to SQLite latency history store")
     parser.add_argument("--retain-days", type=int, default=DEFAULT_RETAIN_DAYS, help="History retention in days (default: 30)")
     parser.add_argument("--window", type=str, default=None, help="Window for --uptime (1h, 24h, 7d, 30d)")
     parser.add_argument("--hours", type=int, default=24, help="Range in hours for --history (default: 24)")
@@ -145,8 +149,15 @@ def parse_args() -> argparse.Namespace:
                         help="Port for Flask+Plotly web dashboard (default: 42069; 0 to disable)")
     parser.add_argument("--stats-interval", type=int, default=10,
                         help="System stats collection interval in seconds (default: 10)")
-    parser.add_argument("--logstore-db", type=Path, default=DEFAULT_LOGSTORE_PATH,
-                        help=f"Path to the server-side logstore SQLite DB (default: {DEFAULT_LOGSTORE_PATH})")
+    parser.add_argument("--logstore-db", type=Path, default=paths.default_logstore_path(),
+                        help="Path to the server-side logstore SQLite DB (default: <data_dir>/logstore.db)")
+    parser.add_argument("--password-from", type=str, default=None,
+                        choices=["systemd-creds", "keyring", "stdin", "env", "pinentry"],
+                        help="Password backend (default: systemd-creds for install-service; env for back-compat at runtime)")
+    parser.add_argument("--user", action="store_true", help="install-service: install as a user unit (default when not running as root)")
+    parser.add_argument("--system", action="store_true", help="install-service: install as a system unit (default when running as root)")
+    parser.add_argument("--force", action="store_true", help="install-service: overwrite an existing unit file")
+    parser.add_argument("--rotate-password", action="store_true", help="install-service: re-encrypt the stored credential under the current backend")
     return parser.parse_args()
 
 
@@ -175,13 +186,49 @@ def configure_logging(*, tui: bool = False, debug: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Control socket routing
+# ---------------------------------------------------------------------------
+
+def _via_socket() -> bool:
+    """True iff the daemon is running and its control socket is reachable."""
+    return control_client.available()
+
+
+def _socket_err(exc: control_client.ControlClientError) -> int:
+    print(f"daemon error: {exc.message}", file=sys.stderr)
+    return 1
+
+
+# ---------------------------------------------------------------------------
 # Password helpers
 # ---------------------------------------------------------------------------
 
+_password_backend_override: str | None = None
+
+
 def _prompt_password(prompt: str = "Password: ") -> str:
-    env = os.environ.get(PASSWORD_ENV)
-    if env is not None:
-        return env
+    """Acquire the identity password via the configured backend.
+
+    Honors ``--password-from``/``$PANIC_MONITOR_PASSWORD_FROM`` when set, else
+    falls back to: env, then a TTY prompt. The pinentry/getpass branch is
+    only ever taken interactively — daemons under systemd should always have
+    a non-interactive backend configured.
+    """
+    from src import password as _pw
+    try:
+        return _pw.get_password(_password_backend_override)
+    except RuntimeError as exc:
+        if sys.stdin.isatty():
+            try:
+                return getpass.getpass(prompt)
+            except (EOFError, KeyboardInterrupt):
+                print("\nAborted.")
+                sys.exit(1)
+        print(f"Password error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _interactive_password(prompt: str) -> str:
     try:
         return getpass.getpass(prompt)
     except (EOFError, KeyboardInterrupt):
@@ -190,12 +237,14 @@ def _prompt_password(prompt: str = "Password: ") -> str:
 
 
 def _prompt_new_password(label: str = "password") -> str:
+    """Always interactive — creating a new password should never read from a
+    backend that already holds one."""
     while True:
-        pw1 = _prompt_password(f"Enter new {label}: ")
+        pw1 = _interactive_password(f"Enter new {label}: ")
         if len(pw1) < MIN_PASSWORD_LENGTH:
             print(f"Password must be at least {MIN_PASSWORD_LENGTH} characters. Try again.")
             continue
-        pw2 = _prompt_password(f"Confirm new {label}: ")
+        pw2 = _interactive_password(f"Confirm new {label}: ")
         if pw1 != pw2:
             print("Passwords do not match. Try again.")
             continue
@@ -335,6 +384,44 @@ async def run_fetch_dashboard(engine: MonitorEngine, target: str) -> int:
 def cli_main() -> None:
     args = parse_args()
 
+    # Propagate the password-backend selection down to _prompt_password.
+    global _password_backend_override
+    _password_backend_override = args.password_from
+
+    # --- install-service / uninstall-service / migrate / rotate ------------
+    if args.install_service or args.uninstall_service or args.rotate_credential:
+        configure_logging(debug=args.debug)
+        from src.service_install import install_service, uninstall_service
+
+        if args.system and args.user:
+            print("Cannot pass both --system and --user.", file=sys.stderr)
+            sys.exit(2)
+        system_flag: bool | None
+        if args.system:
+            system_flag = True
+        elif args.user:
+            system_flag = False
+        else:
+            system_flag = None  # autodetect from euid
+
+        backend = args.password_from or "systemd-creds"
+
+        if args.uninstall_service:
+            sys.exit(uninstall_service(system=system_flag))
+
+        rc = install_service(
+            system=system_flag,
+            force=args.force,
+            password_backend=backend,
+            rotate_password=args.rotate_password or args.rotate_credential,
+        )
+        sys.exit(rc)
+
+    if args.migrate:
+        configure_logging(debug=args.debug)
+        from src.service_install import migrate_legacy_state
+        sys.exit(migrate_legacy_state())
+
     # --- Init -------------------------------------------------------------
     if args.init:
         configure_logging(debug=args.debug)
@@ -421,17 +508,40 @@ def cli_main() -> None:
     # --- List peers (read-only, no password) ------------------------------
     if args.list_peers:
         configure_logging(debug=args.debug)
-        if is_sealed(args.identity, args.identity_meta):
-            node_id = load_meta(args.identity_meta).node_id
-        elif is_raw(args.identity, args.identity_meta):
-            seed = args.identity.read_bytes()
-            node_id = nacl.signing.SigningKey(seed).verify_key.encode().hex()
-        else:
-            print(f"No identity found at {args.identity}. Run --init first.")
-            sys.exit(1)
+        peers = None
+        if _via_socket():
+            try:
+                resp = control_client.get("/v1/peers")
+                # Adapt JSON back to TrustedPeer-like objects for the existing printer.
+                from src.trust import TrustedPeer
+                peers = [
+                    TrustedPeer(
+                        node_id=p["node_id"],
+                        alias=p.get("alias"),
+                        permissions=p.get("permissions") or [],
+                        tags=p.get("tags") or [],
+                        added_at=datetime.fromisoformat(p["added_at"]) if p.get("added_at") else datetime.now(IST),
+                        revoked_at=datetime.fromisoformat(p["revoked_at"]) if p.get("revoked_at") else None,
+                        maintenance_start=datetime.fromisoformat(p["maintenance_start"]) if p.get("maintenance_start") else None,
+                        maintenance_end=datetime.fromisoformat(p["maintenance_end"]) if p.get("maintenance_end") else None,
+                    )
+                    for p in resp.get("peers", [])
+                ]
+            except control_client.ControlClientError as exc:
+                sys.exit(_socket_err(exc))
 
-        _log, trust = _build_trust(None, node_id, args.log_path, args.peers)
-        peers = trust.list_peers()
+        if peers is None:
+            if is_sealed(args.identity, args.identity_meta):
+                node_id = load_meta(args.identity_meta).node_id
+            elif is_raw(args.identity, args.identity_meta):
+                seed = args.identity.read_bytes()
+                node_id = nacl.signing.SigningKey(seed).verify_key.encode().hex()
+            else:
+                print(f"No identity found at {args.identity}. Run --init first.")
+                sys.exit(1)
+
+            _log, trust = _build_trust(None, node_id, args.log_path, args.peers)
+            peers = trust.list_peers()
         if args.filter_tag:
             peers = [p for p in peers if args.filter_tag in p.tags]
         if not peers:
@@ -535,19 +645,34 @@ def cli_main() -> None:
     # --- Add peer ---------------------------------------------------------
     if args.add_peer:
         configure_logging(debug=args.debug)
-        _guard_legacy(args.force_fresh)
         if not validate_node_id(args.add_peer):
             print("NODE_ID must be 64-char lowercase hex.")
             sys.exit(1)
+        perms = [p.strip() for p in args.permissions.split(",") if p.strip()]
+        tags = (
+            [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else None
+        )
+
+        if _via_socket():
+            try:
+                control_client.post("/v1/peers", {
+                    "node_id": args.add_peer,
+                    "alias": args.alias,
+                    "permissions": perms,
+                    "tags": tags or [],
+                })
+                tag_str = f" tags={tags}" if tags else ""
+                print(f"Peer trusted: {args.alias or args.add_peer[:12]}  permissions={perms}{tag_str}")
+                return
+            except control_client.ControlClientError as exc:
+                sys.exit(_socket_err(exc))
+
+        _guard_legacy(args.force_fresh)
         seed, node_id = _unlock_or_exit(args.identity, args.identity_meta)
         if args.add_peer == node_id:
             print("Cannot add yourself as a peer.")
             sys.exit(1)
         _log, trust = _build_trust(seed, node_id, args.log_path, args.peers)
-        perms = [p.strip() for p in args.permissions.split(",") if p.strip()]
-        tags = (
-            [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else None
-        )
         if trust.add_peer(args.add_peer, args.alias, perms, tags):
             tag_str = f" tags={tags}" if tags else ""
             print(f"Peer trusted: {args.alias or args.add_peer[:12]}  permissions={perms}{tag_str}")
@@ -558,6 +683,49 @@ def cli_main() -> None:
     # --- Tags (Slice C) ---------------------------------------------------
     if args.set_tags or args.add_tag or args.remove_tag:
         configure_logging(debug=args.debug)
+
+        # Socket path -----------------------------------------------------
+        if _via_socket():
+            try:
+                # Resolve alias -> node_id via the daemon's peer list.
+                resp = control_client.get("/v1/peers")
+                idx = {p["node_id"]: p for p in resp.get("peers", [])}
+                alias_idx = {p["alias"]: p["node_id"] for p in resp.get("peers", []) if p.get("alias")}
+
+                def _resolve(raw: str) -> str | None:
+                    if raw in idx:
+                        return raw
+                    return alias_idx.get(raw)
+
+                if args.set_tags:
+                    target_raw, csv = args.set_tags
+                    target_nid = _resolve(target_raw)
+                    if target_nid is None:
+                        print(f"Error: unknown peer '{target_raw}'"); sys.exit(1)
+                    tags = [t.strip() for t in csv.split(",") if t.strip()]
+                    control_client.put(f"/v1/peers/{target_nid}/tags", {"tags": tags})
+                    print(f"Tags for {target_raw} set to {tags}")
+                    return
+                if args.add_tag:
+                    target_raw, tag = args.add_tag
+                    target_nid = _resolve(target_raw)
+                    if target_nid is None:
+                        print(f"Error: unknown peer '{target_raw}'"); sys.exit(1)
+                    control_client.post(f"/v1/peers/{target_nid}/tags", {"tag": tag})
+                    print(f"Added tag '{tag}' to {target_raw}")
+                    return
+                # remove_tag
+                target_raw, tag = args.remove_tag
+                target_nid = _resolve(target_raw)
+                if target_nid is None:
+                    print(f"Error: unknown peer '{target_raw}'"); sys.exit(1)
+                control_client.delete(f"/v1/peers/{target_nid}/tags?tag={tag}")
+                print(f"Removed tag '{tag}' from {target_raw}")
+                return
+            except control_client.ControlClientError as exc:
+                sys.exit(_socket_err(exc))
+
+        # Direct fallback -------------------------------------------------
         seed, node_id = _unlock_or_exit(args.identity, args.identity_meta)
         _log, trust = _build_trust(seed, node_id, args.log_path, args.peers)
         if args.set_tags:
@@ -599,6 +767,21 @@ def cli_main() -> None:
             end = _parse_time(end_raw, anchor=start)
         except ValueError as exc:
             print(f"Error: {exc}"); sys.exit(1)
+        if _via_socket():
+            try:
+                resp = control_client.get("/v1/peers")
+                alias_idx = {p["alias"]: p["node_id"] for p in resp.get("peers", []) if p.get("alias")}
+                target_nid = target_raw if validate_node_id(target_raw) else alias_idx.get(target_raw)
+                if target_nid is None:
+                    print(f"Error: unknown peer '{target_raw}'"); sys.exit(1)
+                control_client.put(f"/v1/peers/{target_nid}/maint", {
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                })
+                print(f"Maintenance for {target_raw}: {start.isoformat()} → {end.isoformat()}")
+                return
+            except control_client.ControlClientError as exc:
+                sys.exit(_socket_err(exc))
         seed, node_id = _unlock_or_exit(args.identity, args.identity_meta)
         _log, trust = _build_trust(seed, node_id, args.log_path, args.peers)
         target_nid, err = trust.resolve_target(target_raw)
@@ -612,6 +795,19 @@ def cli_main() -> None:
 
     if args.clear_maintenance:
         configure_logging(debug=args.debug)
+        if _via_socket():
+            try:
+                resp = control_client.get("/v1/peers")
+                alias_idx = {p["alias"]: p["node_id"] for p in resp.get("peers", []) if p.get("alias")}
+                target = args.clear_maintenance
+                target_nid = target if validate_node_id(target) else alias_idx.get(target)
+                if target_nid is None:
+                    print(f"Error: unknown peer '{target}'"); sys.exit(1)
+                control_client.delete(f"/v1/peers/{target_nid}/maint")
+                print(f"Maintenance cleared for {target}")
+                return
+            except control_client.ControlClientError as exc:
+                sys.exit(_socket_err(exc))
         seed, node_id = _unlock_or_exit(args.identity, args.identity_meta)
         _log, trust = _build_trust(seed, node_id, args.log_path, args.peers)
         target_nid, err = trust.resolve_target(args.clear_maintenance)
@@ -649,6 +845,13 @@ def cli_main() -> None:
         if not validate_node_id(target):
             print("NODE_ID must be 64-char lowercase hex.")
             sys.exit(1)
+        if _via_socket():
+            try:
+                control_client.delete(f"/v1/peers/{target}")
+                print(f"Revoked peer {target[:12]}.")
+                return
+            except control_client.ControlClientError as exc:
+                sys.exit(_socket_err(exc))
         seed, node_id = _unlock_or_exit(args.identity, args.identity_meta)
         _log, trust = _build_trust(seed, node_id, args.log_path, args.peers)
         if trust.revoke_peer(target):

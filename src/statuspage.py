@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.server
 import json
 import threading
+import time
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Optional
 from urllib.parse import parse_qs, urlparse
@@ -14,6 +15,15 @@ from src.schema import PeerStatus
 
 if TYPE_CHECKING:
     from src.engine import MonitorEngine
+
+# TTL cache for ``build_dashboard_snapshot`` keyed on the engine identity.
+# /status.json auto-refreshes every 2 s, the Flask page every 5 s, and the
+# peer dashboard pull runs every stats_interval (10 s). Computing the snapshot
+# fans out 6 SQL aggregates per peer, so even a 1 s reuse window collapses
+# concurrent callers onto one computation.
+_SNAPSHOT_CACHE_TTL = 1.0
+_snapshot_cache: dict[int, tuple[float, dict]] = {}
+_snapshot_cache_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Shared ASCII banner — sourced byte-for-byte from the user's master copy
@@ -45,7 +55,24 @@ def build_dashboard_snapshot(engine: "MonitorEngine") -> dict:
 
     Local-only: every field is derived from in-process state, history.db,
     or peers.json — nothing hits the network.
+
+    Cached for ``_SNAPSHOT_CACHE_TTL`` seconds: clients hammering /status.json
+    or /api/stats with sub-second refresh share one computation.
     """
+    cache_key = id(engine)
+    now_mono = time.monotonic()
+    with _snapshot_cache_lock:
+        cached = _snapshot_cache.get(cache_key)
+        if cached is not None and now_mono - cached[0] < _SNAPSHOT_CACHE_TTL:
+            return cached[1]
+
+    snapshot = _build_dashboard_snapshot_uncached(engine)
+    with _snapshot_cache_lock:
+        _snapshot_cache[cache_key] = (now_mono, snapshot)
+    return snapshot
+
+
+def _build_dashboard_snapshot_uncached(engine: "MonitorEngine") -> dict:
     trust = engine.trust
     history = engine.history
     devices = engine.get_device_states()
@@ -76,8 +103,17 @@ def build_dashboard_snapshot(engine: "MonitorEngine") -> dict:
         rtt = history.rtt_stats(node_id, hours=24)
 
         # Prefer the in-memory deque for the live sparkline (newest data);
-        # fall back to disk if the peer was just added.
-        spark_src = list(state.latency_history)[-_SPARKLINE_POINTS:]
+        # fall back to disk if the peer was just added. The deque can be
+        # appended to from the event loop while this runs on an HTTP handler
+        # thread, which can race ``list()`` iteration with ``deque.append`` —
+        # retry once before falling back.
+        try:
+            spark_src = list(state.latency_history)[-_SPARKLINE_POINTS:]
+        except RuntimeError:
+            try:
+                spark_src = list(state.latency_history)[-_SPARKLINE_POINTS:]
+            except RuntimeError:
+                spark_src = []
         if not spark_src:
             spark_src = [
                 # conform to the same shape as LatencyRecord in deque
@@ -129,6 +165,10 @@ def build_dashboard_snapshot(engine: "MonitorEngine") -> dict:
                     "dead_24h": rtt["dead"],
                 },
                 "sparkline": sparkline,
+                "sync_status": state.sync_status.value,
+                "last_sync_ts": state.last_sync_ts.isoformat() if state.last_sync_ts else None,
+                "has_dashboard_gap": state.has_dashboard_gap,
+                "last_stats": state.last_stats,
             }
         )
 
@@ -155,6 +195,20 @@ def build_dashboard_snapshot(engine: "MonitorEngine") -> dict:
     avg_uptime_24h = (
         avg_uptime_sum / avg_uptime_count if avg_uptime_count else None
     )
+
+    # Own stats — included in the dashboard payload so a peer pulling us via
+    # status/0 ALPN can render our live CPU/mem/disk without a separate ALPN.
+    # Capped by STATUS_RESPONSE_MAX upstream; recent_snapshots_for_peer is
+    # already bounded to ~1h at 10s interval (~360 entries).
+    own_stats = engine.get_own_stats()
+    own_stats_history: list[dict] = []
+    if engine.logstore is not None:
+        try:
+            own_stats_history = engine.logstore.recent_snapshots_for_peer(
+                engine.node_id, hours=1
+            )
+        except Exception:  # noqa: BLE001
+            own_stats_history = []
 
     return {
         "source": {
@@ -192,6 +246,8 @@ def build_dashboard_snapshot(engine: "MonitorEngine") -> dict:
         },
         "peers": peers_out,
         "events": events_out,
+        "own_stats": own_stats,
+        "own_stats_history": own_stats_history,
     }
 
 

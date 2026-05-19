@@ -1,39 +1,84 @@
-# Python
+# ───────────────────────────────────────────────────────────────────────
+# Python build / runtime artifacts
+# ───────────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 *.egg-info/
+*.egg
 dist/
 build/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
 
-# Venv
+# Virtualenvs
 .venv/
+venv/
+env/
 
-# Secrets & per-machine identity
+# ───────────────────────────────────────────────────────────────────────
+# Per-machine state (NEVER commit)
+# ───────────────────────────────────────────────────────────────────────
+# Sealed identity + metadata — these are the device's signing key
 secret.key
 secret.meta
-
-# Trust log + materialized cache (per-machine)
+# Encrypted password credential rendered by systemd-creds
+password.cred
+# Trust log + materialized peer cache
 log.jsonl
 peers.json
-
-# Logs
-*.log
-
-# Runtime databases (per-machine SQLite stores)
+# SQLite stores + WAL/SHM siblings
 *.db
 *.db-shm
 *.db-wal
+*.db-journal
+# Runtime sockets / pidfiles
+*.sock
+*.pid
 
-# Backup files
+# Logs
+*.log
+*.log.*
+
+# Editor / system clutter
 *.bak
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
 
-# Markdown files
+# ───────────────────────────────────────────────────────────────────────
+# Project-specific scratch
+# ───────────────────────────────────────────────────────────────────────
+# Local command / scratchpad notes — never relevant upstream
+commands.txt
+downloads/
+# UI reference lifted from another project; kept locally for design parity
+example_layout.html
+
+# Stale unit file from earlier versions (now rendered from
+# src/templates/panic-monitor.service.tmpl)
+panic-monitor.service
+
+# ───────────────────────────────────────────────────────────────────────
+# Documentation — ship only the README
+# ───────────────────────────────────────────────────────────────────────
 *.md
 !README.md
 
-# Local agent settings
+# ───────────────────────────────────────────────────────────────────────
+# Tooling / IDE
+# ───────────────────────────────────────────────────────────────────────
 .claude/
-
-# IDE
 .vscode/
 .idea/
+.zed/
+*.sublime-project
+*.sublime-workspace

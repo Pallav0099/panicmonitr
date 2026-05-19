@@ -14,6 +14,8 @@ from argon2.low_level import Type, hash_secret_raw
 from loguru import logger
 from pydantic import BaseModel
 
+from src import paths
+
 SECRET_KEY_LENGTH = 32
 ARGON2_TIME_COST = 3
 ARGON2_MEMORY_COST = 65536  # 64 MiB
@@ -23,8 +25,19 @@ MIN_PASSWORD_LENGTH = 12
 
 _HEX_64_RE = re.compile(r"^[0-9a-f]{64}$")
 
-DEFAULT_IDENTITY_PATH = Path("./secret.key")
-DEFAULT_META_PATH = Path("./secret.meta")
+
+def _default_identity_path() -> Path:
+    return paths.default_identity_path()
+
+
+def _default_meta_path() -> Path:
+    return paths.default_meta_path()
+
+
+# Back-compat aliases. Code that imports these gets a Path resolved at import
+# time; for fresh resolution (env overrides), prefer paths.default_*_path().
+DEFAULT_IDENTITY_PATH = _default_identity_path()
+DEFAULT_META_PATH = _default_meta_path()
 
 
 def validate_node_id(value: str) -> bool:
