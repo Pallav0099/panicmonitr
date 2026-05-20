@@ -49,11 +49,14 @@ What you get out of the box:
 
 ## Prerequisites
 
-- Linux with **systemd ≥ 250** (for `systemd-creds` credential encryption)
+- Linux with **systemd ≥ 250** for system-wide service installation, or **systemd ≥ 256** for user-mode service installation using `systemd-creds`.
 - **Python 3.12+**
 - A working **TPM2** chip is nice-to-have but not required; `systemd-creds`
-  falls back to the per-user host key automatically
-- **Docker** (optional — needed only for container stats collection)
+  falls back to the per-user host key automatically.
+- **Docker** (optional — needed only for container stats collection).
+
+**Note:** If you are running a stable Linux distribution (like Ubuntu 24.04) with **systemd < 256**, you cannot use `systemd-creds` for user-mode installation. Instead, use the **keyring** backend:
+`panic-monitor --install-service --password-from keyring`
 
 ---
 

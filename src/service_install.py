@@ -221,6 +221,24 @@ def install_service(
                 print(str(exc), file=sys.stderr)
                 return 1
             print(f"Encrypted credential written to {credential_file}")
+    elif password_backend == "keyring":
+        try:
+            import keyring
+        except ImportError:
+            print(
+                "The 'keyring' package is not installed. Please install it with:\n"
+                "pip install keyring",
+                file=sys.stderr,
+            )
+            return 1
+        print("Enter the identity password to store in the OS keyring.")
+        password = _prompt_password()
+        try:
+            keyring.set_password("panic-monitor", "identity", password)
+            print("Password successfully stored in keyring.")
+        except Exception as exc:
+            print(f"Failed to store password in keyring: {exc}", file=sys.stderr)
+            return 1
 
     # Render + write unit ---------------------------------------------------
     exec_start = _resolve_exec_start()

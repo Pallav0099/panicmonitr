@@ -15,6 +15,7 @@ dependencies = [
     "docker>=7.0",
     "flask>=3.0",
     "plotly>=5.20",
+    "keyring>=25.0",
 ]
 
 [project.scripts]
