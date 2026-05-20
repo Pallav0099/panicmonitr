@@ -100,7 +100,6 @@ _ASCII_SVG = _ascii_to_svg(_ASCII_PANICMONITR)
 
 # ---------------------------------------------------------------------------
 # HTML — rendered ONCE. All live values flow in via /api/dashboard.
-# Palette + typography lifted from example_layout.html (the user's reference).
 # ---------------------------------------------------------------------------
 
 _HTML = """<!DOCTYPE html>
@@ -219,16 +218,74 @@ body {
 }
 .btn:hover { background: var(--accent); color: var(--bg-primary); box-shadow: var(--glow); }
 
-/* ─── Cards (label floats on top border) ───────────────────────────── */
+/* ─── Fleet Cards ───────────────────────────────────────────────────── */
+.fleet-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 1.2rem;
+}
+
+.node-card {
+  border: 2px solid var(--border);
+  background: var(--panel);
+  padding: 18px;
+  box-shadow: var(--shadow);
+  position: relative;
+  transition: all 0.2s;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.node-card:hover { border-color: var(--accent); transform: translateY(-2px); }
+.node-card.selected { border-color: var(--accent-light); box-shadow: var(--glow); }
+
+.node-header { display: flex; justify-content: space-between; align-items: flex-start; }
+.node-alias { font-size: 1rem; font-weight: 600; color: var(--text-bright); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.node-id-short { font-size: 0.62rem; color: var(--text-dim); }
+
+.node-status { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+.status-pill { padding: 2px 8px; font-size: 0.6rem; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; border: 1px solid currentColor; border-radius: 2px; }
+.status-pill.ALIVE { color: var(--teal); }
+.status-pill.DEAD { color: var(--red); }
+.status-pill.UNKNOWN { color: var(--text-muted); }
+
+.node-mini-stats { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+.mini-bar { display: flex; align-items: center; gap: 8px; font-size: 0.65rem; color: var(--text-muted); }
+.mini-bar-track { flex: 1; height: 4px; background: var(--panel-strong); border-radius: 2px; overflow: hidden; }
+.mini-bar-fill { height: 100%; transition: width 0.3s ease; }
+.mini-bar-fill.cpu { background: var(--teal); }
+.mini-bar-fill.mem { background: var(--violet); }
+.mini-bar-fill.disk { background: rgb(74, 125, 181); }
+
+/* ─── Detailed View (Node Dashboard) ────────────────────────────────── */
+.detail-view {
+  display: flex;
+  flex-direction: column;
+  gap: 1.2rem;
+  animation: fadeIn 0.3s ease-out;
+}
+@keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+.detail-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 8px;
+}
+.detail-header h2 { font-size: 1.2rem; color: var(--accent-title); letter-spacing: 1px; }
+.back-btn { font-size: 0.7rem; color: var(--text-muted); cursor: pointer; text-transform: uppercase; letter-spacing: 1px; border: 1px solid var(--border); padding: 4px 8px; }
+.back-btn:hover { color: var(--text-bright); border-color: var(--text-muted); }
+
 .card {
   border: 2px solid var(--border);
   background: var(--panel);
   padding: 22px 22px 18px;
   box-shadow: var(--shadow);
   position: relative;
-  transition: border-color 0.2s;
 }
-.card:hover { border-color: var(--border-strong); }
 .card-label {
   position: absolute; top: -10px; left: 16px;
   background: var(--panel); padding: 0 10px;
@@ -236,17 +293,6 @@ body {
   letter-spacing: 2px; text-transform: uppercase;
 }
 
-/* ─── Stat tiles row ────────────────────────────────────────────────── */
-.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 14px 24px; }
-.tile { display: flex; flex-direction: column; gap: 2px; }
-.tile .k { font-size: 0.62rem; color: var(--text-dim); letter-spacing: 1.5px; text-transform: uppercase; }
-.tile .v { font-size: 1.15rem; font-weight: 600; color: var(--text-bright); letter-spacing: 0.5px; }
-.tile .v.alive { color: var(--teal); }
-.tile .v.dead { color: var(--red); }
-.tile .v.accent { color: var(--accent-light); }
-.tile .v.muted { color: var(--text-muted); }
-
-/* ─── Bars (CPU / MEM / DISK) ──────────────────────────────────────── */
 .bars { display: flex; flex-direction: column; gap: 9px; }
 .bar-row { display: grid; grid-template-columns: 46px 1fr 56px; align-items: center; gap: 12px; }
 .bar-label { font-size: 0.7rem; color: var(--text-muted); letter-spacing: 1px; }
@@ -263,41 +309,12 @@ body {
 }
 .sysmeta strong { color: var(--text-bright); font-weight: 500; }
 
-/* ─── Peer table ───────────────────────────────────────────────────── */
-.peers-card { padding: 22px 0 14px; }
-.peers-card .card-label { left: 16px; }
-table.peers { width: 100%; border-collapse: collapse; font-size: 0.72rem; }
-table.peers th, table.peers td { text-align: left; padding: 8px 16px; }
-table.peers th {
-  color: var(--text-dim); font-weight: 500; letter-spacing: 1.5px;
-  text-transform: uppercase; font-size: 0.62rem;
-  border-bottom: 1px solid var(--border);
-}
-table.peers td { border-bottom: 1px solid var(--border-soft); }
-table.peers tbody tr:last-child td { border-bottom: none; }
-table.peers tbody tr:hover td { background: var(--panel-strong); }
+.grid-two { display: grid; grid-template-columns: 1fr 1fr; gap: 1.2rem; }
+@media (max-width: 900px) { .grid-two { grid-template-columns: 1fr; } }
 
-.pill { display: inline-block; padding: 2px 8px; font-size: 0.62rem; font-weight: 600; letter-spacing: 1px; text-transform: uppercase; border: 1px solid currentColor; }
-.pill.alive { color: var(--teal); }
-.pill.dead { color: var(--red); }
-.pill.unknown { color: var(--text-muted); }
-.pill.maint { color: var(--accent); }
-.pill.unreach { color: var(--accent-light); }
+.chart-host { width: 100%; min-height: 240px; }
 
-.sync-tag { font-size: 0.6rem; letter-spacing: 1px; color: var(--text-dim); text-transform: uppercase; }
-.sync-tag.live { color: var(--teal); }
-.sync-tag.gap { color: var(--accent-light); }
-.sync-tag.syncing { color: var(--accent); }
-
-.peer-alias { color: var(--text-bright); font-weight: 500; }
-.peer-id { font-size: 0.62rem; color: var(--text-dim); display: block; margin-top: 1px; }
-.tag-pill { display: inline-block; font-size: 0.6rem; color: var(--accent-light); border: 1px solid var(--border); padding: 1px 6px; margin-right: 4px; }
-.uptime-good { color: var(--teal); }
-.uptime-warn { color: var(--accent-light); }
-.uptime-bad { color: var(--red); }
-.empty { padding: 24px 16px; color: var(--text-dim); text-align: center; font-size: 0.75rem; letter-spacing: 1px; }
-
-/* ─── Container grid (now expandable via <details>) ────────────────── */
+/* ─── Containers Grid ───────────────────────────────────────────────── */
 .containers { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; }
 .ctn {
   background: var(--bg-secondary); border: 1px solid var(--border); padding: 10px 12px;
@@ -351,7 +368,7 @@ table.peers tbody tr:hover td { background: var(--panel-strong); }
 .ctn-logs.placeholder { color: var(--text-dim); font-style: italic; }
 .ctn-logs.error { color: var(--red); }
 
-/* ─── Processes table (btop-style) ─────────────────────────────────── */
+/* ─── Processes Table ───────────────────────────────────────────────── */
 .proc-controls {
   display: flex; align-items: center; gap: 10px;
   margin-bottom: 12px; font-size: 0.7rem; color: var(--text-dim);
@@ -365,31 +382,41 @@ table.peers tbody tr:hover td { background: var(--panel-strong); }
 }
 .proc-controls select:hover { border-color: var(--border-strong); }
 .proc-summary { margin-left: auto; color: var(--text-muted); text-transform: none; letter-spacing: 0.5px; font-size: 0.65rem; }
-table.proc-table th.num,
-table.proc-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
-table.proc-table tbody td { padding: 6px 14px; }
+
+table.proc-table { width: 100%; border-collapse: collapse; font-size: 0.72rem; }
+table.proc-table th, table.proc-table td { text-align: left; padding: 6px 14px; }
+table.proc-table th {
+  color: var(--text-dim); font-weight: 500; letter-spacing: 1.5px;
+  text-transform: uppercase; font-size: 0.62rem;
+  border-bottom: 1px solid var(--border);
+}
+table.proc-table td { border-bottom: 1px solid var(--border-soft); }
+table.proc-table th.num, table.proc-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
 table.proc-table .pid { color: var(--text-muted); }
 table.proc-table .user { color: var(--accent-light); }
 table.proc-table .cpu-hot { color: var(--accent-light); }
 table.proc-table .cpu-cold { color: var(--text-muted); }
 table.proc-table .mem-hot { color: var(--violet); }
-table.proc-table .mem-cold { color: var(--text-muted); }
 table.proc-table .cmd { color: var(--text-primary); font-size: 0.68rem; max-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 table.proc-table .state-running  { color: var(--teal); }
 table.proc-table .state-sleeping { color: var(--text-muted); }
-table.proc-table .state-zombie,
-table.proc-table .state-stopped  { color: var(--red); }
-
-.chart-host { width: 100%; min-height: 240px; }
-
-/* ─── Layout grid for the cards ────────────────────────────────────── */
-.grid-two { display: grid; grid-template-columns: 1fr 1fr; gap: 1.2rem; }
-@media (max-width: 900px) { .grid-two { grid-template-columns: 1fr; } }
 
 footer.foot {
   text-align: center; font-size: 0.62rem; color: var(--text-faint);
-  letter-spacing: 2px; text-transform: uppercase; padding-top: 16px;
+  letter-spacing: 2px; text-transform: uppercase; padding-top: 32px;
 }
+
+.empty { padding: 48px; text-align: center; color: var(--text-dim); font-size: 0.8rem; letter-spacing: 1px; }
+
+/* ─── Uptime Section ────────────────────────────────────────────────── */
+.uptime-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); gap: 12px; margin-bottom: 1.2rem; }
+.uptime-tile { border: 1px solid var(--border); background: var(--panel-strong); padding: 10px; display: flex; flex-direction: column; gap: 2px; }
+.uptime-tile .k { font-size: 0.58rem; color: var(--text-dim); letter-spacing: 1px; text-transform: uppercase; }
+.uptime-tile .v { font-size: 0.9rem; font-weight: 600; color: var(--text-bright); }
+.uptime-good { color: var(--teal); }
+.uptime-warn { color: var(--accent-light); }
+.uptime-bad { color: var(--red); }
+
 </style>
 </head>
 <body>
@@ -421,105 +448,100 @@ footer.foot {
     </div>
   </div>
 
-  <div class="card">
-    <div class="card-label">[Fleet]</div>
-    <div class="tiles">
-      <div class="tile"><span class="k">Targets</span><span class="v" id="t-targets">—</span></div>
-      <div class="tile"><span class="k">Alive</span><span class="v alive" id="t-alive">—</span></div>
-      <div class="tile"><span class="k">Dead</span><span class="v dead" id="t-dead">—</span></div>
-      <div class="tile"><span class="k">Maint</span><span class="v accent" id="t-maint">—</span></div>
-      <div class="tile"><span class="k">Avg Uptime 24h</span><span class="v" id="t-uptime">—</span></div>
-      <div class="tile"><span class="k">Probes 24h</span><span class="v muted" id="t-probes">—</span></div>
-    </div>
-  </div>
+  <!-- Fleet View -->
+  <div id="fleet-view" class="fleet-grid"></div>
 
-  <div class="grid-two">
-    <div class="card" id="system-card">
-      <div class="card-label">[System]</div>
-      <div class="bars">
-        <div class="bar-row">
-          <span class="bar-label">CPU</span>
-          <div class="bar-track"><div class="bar-fill cpu" id="bar-cpu" style="width:0"></div></div>
-          <span class="bar-val" id="val-cpu">—</span>
+  <!-- Detail View (hidden by default) -->
+  <div id="detail-view" class="detail-view" style="display:none">
+    <div class="detail-header">
+      <div class="back-btn" id="back-to-fleet">&larr; Back to Fleet</div>
+      <h2 id="detail-node-name">Node Name</h2>
+      <span id="detail-node-id" style="font-size:0.7rem; color:var(--text-dim)"></span>
+    </div>
+
+    <div class="uptime-tiles">
+      <div class="uptime-tile"><span class="k">24h Uptime</span><span class="v" id="dt-up-24h">—</span></div>
+      <div class="uptime-tile"><span class="k">Last Seen</span><span class="v" id="dt-seen">—</span></div>
+      <div class="uptime-tile"><span class="k">RTT</span><span class="v" id="dt-rtt">—</span></div>
+      <div class="uptime-tile"><span class="k">Sync</span><span class="v" id="dt-sync">—</span></div>
+    </div>
+
+    <div class="grid-two">
+      <div class="card" id="system-card">
+        <div class="card-label">[System]</div>
+        <div class="bars">
+          <div class="bar-row">
+            <span class="bar-label">CPU</span>
+            <div class="bar-track"><div class="bar-fill cpu" id="bar-cpu" style="width:0"></div></div>
+            <span class="bar-val" id="val-cpu">—</span>
+          </div>
+          <div class="bar-row">
+            <span class="bar-label">MEM</span>
+            <div class="bar-track"><div class="bar-fill mem" id="bar-mem" style="width:0"></div></div>
+            <span class="bar-val" id="val-mem">—</span>
+          </div>
+          <div class="bar-row">
+            <span class="bar-label">DISK</span>
+            <div class="bar-track"><div class="bar-fill disk" id="bar-disk" style="width:0"></div></div>
+            <span class="bar-val" id="val-disk">—</span>
+          </div>
         </div>
-        <div class="bar-row">
-          <span class="bar-label">MEM</span>
-          <div class="bar-track"><div class="bar-fill mem" id="bar-mem" style="width:0"></div></div>
-          <span class="bar-val" id="val-mem">—</span>
-        </div>
-        <div class="bar-row">
-          <span class="bar-label">DISK</span>
-          <div class="bar-track"><div class="bar-fill disk" id="bar-disk" style="width:0"></div></div>
-          <span class="bar-val" id="val-disk">—</span>
+        <div class="sysmeta" id="sysmeta">
+          <span>Host: <strong id="m-host">—</strong></span>
+          <span>Load: <strong id="m-load">—</strong></span>
+          <span>Procs: <strong id="m-procs">—</strong></span>
+          <span>Temp: <strong id="m-temp">—</strong></span>
+          <span>Net &darr; <strong id="m-rx">—</strong></span>
+          <span>Net &uarr; <strong id="m-tx">—</strong></span>
         </div>
       </div>
-      <div class="sysmeta" id="sysmeta">
-        <span>Host: <strong id="m-host">—</strong></span>
-        <span>Load: <strong id="m-load">—</strong></span>
-        <span>Procs: <strong id="m-procs">—</strong></span>
-        <span>Temp: <strong id="m-temp">—</strong></span>
-        <span>Net &darr; <strong id="m-rx">—</strong></span>
-        <span>Net &uarr; <strong id="m-tx">—</strong></span>
+
+      <div class="card" id="chart-card">
+        <div class="card-label">[CPU &middot; MEM &mdash; last hour]</div>
+        <div class="chart-host" id="chart-cpu-mem"></div>
       </div>
     </div>
 
-    <div class="card" id="chart-card">
-      <div class="card-label">[CPU &middot; MEM &mdash; last hour]</div>
-      <div class="chart-host" id="chart-cpu-mem"></div>
-    </div>
-  </div>
-
-  <div class="card" id="processes-card">
-    <div class="card-label">[Processes]</div>
-    <div class="proc-controls">
-      <label for="proc-sort">sort</label>
-      <select id="proc-sort">
-        <option value="cpu" selected>CPU %</option>
-        <option value="mem">MEM %</option>
-        <option value="rss">RSS</option>
-        <option value="pid">PID</option>
-      </select>
-      <label for="proc-limit">show</label>
-      <select id="proc-limit">
-        <option value="10">top 10</option>
-        <option value="20" selected>top 20</option>
-        <option value="50">top 50</option>
-      </select>
-      <span class="proc-summary" id="proc-summary"></span>
-    </div>
-    <table class="peers proc-table" id="processes-table" style="display:none">
-      <thead>
-        <tr>
-          <th class="num">PID</th>
-          <th>User</th>
-          <th class="num">CPU %</th>
-          <th class="num">MEM %</th>
-          <th class="num">RSS</th>
-          <th class="num">Thr</th>
-          <th>State</th>
-          <th>Command</th>
-        </tr>
-      </thead>
-      <tbody id="processes-body"></tbody>
-    </table>
-    <div class="empty" id="processes-empty">no process data — psutil may be missing</div>
-  </div>
-
-  <div class="card" id="containers-card" style="display:none">
-    <div class="card-label">[Containers]</div>
-    <div class="containers" id="containers"></div>
-  </div>
-
-  <div class="card peers-card">
-    <div class="card-label">[Peers]</div>
-    <div id="peers-host">
-      <table class="peers" id="peers-table" style="display:none">
+    <div class="card" id="processes-card">
+      <div class="card-label">[Processes]</div>
+      <div class="proc-controls">
+        <label for="proc-sort">sort</label>
+        <select id="proc-sort">
+          <option value="cpu" selected>CPU %</option>
+          <option value="mem">MEM %</option>
+          <option value="rss">RSS</option>
+          <option value="pid">PID</option>
+        </select>
+        <label for="proc-limit">show</label>
+        <select id="proc-limit">
+          <option value="10">top 10</option>
+          <option value="20" selected>top 20</option>
+          <option value="50">top 50</option>
+        </select>
+        <span class="proc-summary" id="proc-summary"></span>
+      </div>
+      <table class="proc-table" id="processes-table" style="display:none">
         <thead>
-          <tr><th>Alias</th><th>Status</th><th>Sync</th><th>RTT</th><th>24h Uptime</th><th>Last Seen</th><th>Tags</th></tr>
+          <tr>
+            <th class="num">PID</th>
+            <th>User</th>
+            <th class="num">CPU %</th>
+            <th class="num">MEM %</th>
+            <th class="num">RSS</th>
+            <th class="num">Thr</th>
+            <th>State</th>
+            <th>Command</th>
+          </tr>
         </thead>
-        <tbody id="peers-body"></tbody>
+        <tbody id="processes-body"></tbody>
       </table>
-      <div class="empty" id="peers-empty">no peers monitored — add one with <code>panic-monitor --add-peer &lt;NODE_ID&gt;</code></div>
+      <div class="empty" id="processes-empty">no process data for this node</div>
+    </div>
+
+    <div class="card" id="containers-card">
+      <div class="card-label">[Containers]</div>
+      <div class="containers" id="containers"></div>
+      <div class="empty" id="containers-empty" style="display:none">no containers reported</div>
     </div>
   </div>
 
@@ -536,61 +558,49 @@ footer.foot {
   let pollHandle = null;
   let inFlight = false;
   let chartReady = false;
-  let lastOkAt = 0;
+  let selectedNodeId = null;
+  let ownNodeId = null;
+  let nodes = [];
 
-  // ── Element refs (looked up once) ───────────────────────────────────
+  // ── Element refs ────────────────────────────────────────────────────
   const $ = (id) => document.getElementById(id);
-  const liveDot    = $('live-dot');
+  const fleetView = $('fleet-view');
+  const detailView = $('detail-view');
+  const backToFleet = $('back-to-fleet');
+
+  const liveDot = $('live-dot');
   const statusText = $('status-text');
-  const roleVal    = $('role-val');
-  const nodeVal    = $('node-val');
+  const roleVal = $('role-val');
+  const nodeVal = $('node-val');
   const intervalEl = $('interval');
   const refreshBtn = $('refresh-now');
 
-  const tTargets = $('t-targets');
-  const tAlive   = $('t-alive');
-  const tDead    = $('t-dead');
-  const tMaint   = $('t-maint');
-  const tUptime  = $('t-uptime');
-  const tProbes  = $('t-probes');
-
-  const barCpu = $('bar-cpu'),   valCpu  = $('val-cpu');
-  const barMem = $('bar-mem'),   valMem  = $('val-mem');
-  const barDisk= $('bar-disk'),  valDisk = $('val-disk');
+  const barCpu = $('bar-cpu'), valCpu = $('val-cpu');
+  const barMem = $('bar-mem'), valMem = $('val-mem');
+  const barDisk = $('bar-disk'), valDisk = $('val-disk');
   const mHost = $('m-host'), mLoad = $('m-load'), mProcs = $('m-procs');
-  const mTemp = $('m-temp'), mRx   = $('m-rx'),   mTx    = $('m-tx');
-  const systemCard = $('system-card');
+  const mTemp = $('m-temp'), mRx = $('m-rx'), mTx = $('m-tx');
 
-  const ctnCard = $('containers-card');
   const ctnHost = $('containers');
+  const ctnEmpty = $('containers-empty');
 
-  const procCard    = $('processes-card');
-  const procTable   = $('processes-table');
-  const procBody    = $('processes-body');
-  const procEmpty   = $('processes-empty');
-  const procSort    = $('proc-sort');
-  const procLimit   = $('proc-limit');
+  const procTable = $('processes-table');
+  const procBody = $('processes-body');
+  const procEmpty = $('processes-empty');
+  const procSort = $('proc-sort');
+  const procLimit = $('proc-limit');
   const procSummary = $('proc-summary');
-
-  const peersTable = $('peers-table');
-  const peersBody  = $('peers-body');
-  const peersEmpty = $('peers-empty');
 
   const chartHost = $('chart-cpu-mem');
 
+  const dtUp24 = $('dt-up-24h'), dtSeen = $('dt-seen'), dtRtt = $('dt-rtt'), dtSync = $('dt-sync');
+
   // Persisted UI preferences for the processes table.
-  const PROC_SORT_KEY  = 'panic-monitor.proc-sort';
+  const PROC_SORT_KEY = 'panic-monitor.proc-sort';
   const PROC_LIMIT_KEY = 'panic-monitor.proc-limit';
-  procSort.value  = localStorage.getItem(PROC_SORT_KEY)  || 'cpu';
+  procSort.value = localStorage.getItem(PROC_SORT_KEY) || 'cpu';
   procLimit.value = localStorage.getItem(PROC_LIMIT_KEY) || '20';
 
-  // Latest snapshot of processes — re-rendered locally when the user flips
-  // sort/limit without waiting for the next poll.
-  let lastProcesses = [];
-
-  // Per-container log-fetch state: { lastFetchTs: number, pending: boolean }.
-  // Keyed by container id so we don't refetch every poll. A re-expand after
-  // >5 s triggers a refresh.
   const logState = new Map();
   const LOG_REFRESH_MS = 5000;
 
@@ -599,9 +609,7 @@ footer.foot {
   const fmtNum = (v, digits=2) => (v == null || isNaN(v)) ? '—' : v.toFixed(digits);
   const fmtMB  = (b) => (b == null) ? '—' : (b / 1048576).toFixed(1) + ' MB';
   const upClass = (v) => v == null ? '' : v >= 99 ? 'uptime-good' : v >= 95 ? 'uptime-warn' : 'uptime-bad';
-  const upTileClass = (v) => v == null ? 'muted' : v >= 99 ? 'alive' : v >= 95 ? 'accent' : 'dead';
 
-  // Adaptive bytes formatter: 0 .. ∞ → KB/MB/GB/TB, two-digit precision.
   function fmtBytes(b) {
     if (b == null || isNaN(b)) return '—';
     if (b < 1024) return b + ' B';
@@ -611,7 +619,6 @@ footer.foot {
     return v.toFixed(v < 10 ? 2 : 1) + ' ' + units[i];
   }
 
-  // Compact "h/m/s ago" for a created_at ISO string.
   function fmtAgo(iso) {
     if (!iso) return '—';
     const t = Date.parse(iso);
@@ -633,278 +640,139 @@ footer.foot {
   }
 
   function setText(el, text) { if (el.textContent !== text) el.textContent = text; }
-  function setWidth(el, pct) {
-    const w = Math.max(0, Math.min(100, pct || 0));
-    el.style.width = w + '%';
+  function setWidth(el, pct) { el.style.width = Math.max(0, Math.min(100, pct || 0)) + '%'; }
+  function escapeHtml(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+
+  // ── Navigation ──────────────────────────────────────────────────────
+  function showFleet() {
+    selectedNodeId = null;
+    detailView.style.display = 'none';
+    fleetView.style.display = 'grid';
+    chartReady = false;
   }
 
-  function escapeHtml(s) {
-    if (s == null) return '';
-    return String(s)
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  function selectNode(nid) {
+    selectedNodeId = nid;
+    fleetView.style.display = 'none';
+    detailView.style.display = 'flex';
+    chartReady = false;
+    paintDetails();
   }
 
-  // ── Header / live indicator ────────────────────────────────────────
-  function setLiveState(state, msg) {
-    // state: 'ok' | 'stale' | 'paused'
-    liveDot.classList.remove('stale', 'paused');
-    if (state === 'stale') liveDot.classList.add('stale');
-    if (state === 'paused') liveDot.classList.add('paused');
-    statusText.textContent = msg;
-  }
+  backToFleet.onclick = showFleet;
 
-  // ── Renderers (idempotent: safe to call every tick) ────────────────
-  function renderFleet(d) {
-    setText(tTargets, String(d.counts.monitor_targets ?? 0));
-    setText(tAlive,   String(d.counts.alive ?? 0));
-    setText(tDead,    String(d.counts.dead ?? 0));
-    setText(tMaint,   String(d.counts.maintenance ?? 0));
-
-    const up = d.avg_uptime_24h;
-    setText(tUptime, up == null ? '—' : fmtPct(up));
-    tUptime.className = 'v ' + upTileClass(up);
-
-    setText(tProbes, d.probes_24h == null ? '—' : d.probes_24h.toLocaleString());
-  }
-
-  function renderSystem(d) {
-    const s = d.own_stats;
-    if (!s) {
-      systemCard.style.display = 'none';
-      return;
-    }
-    systemCard.style.display = '';
-    setWidth(barCpu,  s.cpu_percent);
-    setWidth(barMem,  s.mem_percent);
-    setWidth(barDisk, s.disk_percent);
-    setText(valCpu,  fmtPct(s.cpu_percent));
-    setText(valMem,  fmtPct(s.mem_percent));
-    setText(valDisk, fmtPct(s.disk_percent));
-
-    setText(mHost, s.hostname || '—');
-    setText(mLoad,
-      [s.load_avg_1m, s.load_avg_5m, s.load_avg_15m]
-        .map((v) => fmtNum(v))
-        .join(' / ')
-    );
-    setText(mProcs, s.process_count != null ? String(s.process_count) : '—');
-    setText(mTemp,  s.cpu_temp != null ? fmtNum(s.cpu_temp, 1) + '°C' : '—');
-    setText(mRx,    fmtMB(s.net_recv_bytes));
-    setText(mTx,    fmtMB(s.net_sent_bytes));
-  }
-
-  // ── Containers: diff-by-name, expandable via <details> ────────────
-  function renderContainers(d) {
-    const list = (d.own_stats && d.own_stats.containers) || [];
-    if (!list.length) {
-      ctnCard.style.display = 'none';
-      ctnHost.innerHTML = '';
-      return;
-    }
-    ctnCard.style.display = '';
-
+  // ── Renderers ───────────────────────────────────────────────────────
+  function paintFleet() {
     const existing = new Map();
-    for (const el of ctnHost.children) existing.set(el.dataset.name, el);
+    for (const el of fleetView.children) existing.set(el.dataset.id, el);
     const seen = new Set();
     let prevEl = null;
-    for (const c of list) {
-      seen.add(c.name);
-      let el = existing.get(c.name);
+
+    for (const node of nodes) {
+      seen.add(node.node_id);
+      let el = existing.get(node.node_id);
       if (!el) {
-        el = document.createElement('details');
-        el.className = 'ctn';
-        el.dataset.name = c.name;
-        el.dataset.id = c.id || '';
-        el.innerHTML =
-          '<summary>' +
-            '<div class="img"></div>' +
-            '<div class="name"></div>' +
-            '<div class="status"></div>' +
-            '<div class="stat"></div>' +
-          '</summary>' +
-          '<div class="ctn-detail">' +
-            '<div class="kv"><span class="k">image</span><span class="v d-image"></span></div>' +
-            '<div class="kv"><span class="k">id</span><span class="v d-id"></span></div>' +
-            '<div class="kv"><span class="k">command</span><span class="v d-cmd"></span></div>' +
-            '<div class="kv"><span class="k">created</span><span class="v d-created"></span></div>' +
-            '<div class="kv"><span class="k">started</span><span class="v d-started"></span></div>' +
-            '<div class="kv"><span class="k">restarts</span><span class="v d-restarts"></span></div>' +
-            '<div class="kv"><span class="k">network</span><span class="v d-net"></span></div>' +
-            '<div class="kv"><span class="k">block io</span><span class="v d-blk"></span></div>' +
-            '<div class="kv"><span class="k">memory</span><span class="v d-mem-full"></span></div>' +
-            '<div class="kv"><span class="k">ports</span><span class="v d-ports"></span></div>' +
-            '<div class="kv"><span class="k">mounts</span><span class="v d-mounts"></span></div>' +
-            '<div class="kv"><span class="k">health</span><span class="v d-health"></span></div>' +
-            '<div class="ctn-logs-host">' +
-              '<div class="head">' +
-                '<span>recent logs</span>' +
-                '<button class="btn ctn-log-refresh" type="button">[Refresh]</button>' +
-              '</div>' +
-              '<pre class="ctn-logs placeholder">expand to load &middot; or click [Refresh]</pre>' +
-            '</div>' +
-          '</div>';
-        el.addEventListener('toggle', onContainerToggle);
-        el.querySelector('.ctn-log-refresh').addEventListener('click', (ev) => {
-          ev.preventDefault();
-          ev.stopPropagation();
-          fetchContainerLogs(el, /*force=*/true);
-        });
+        el = document.createElement('div');
+        el.className = 'node-card';
+        el.dataset.id = node.node_id;
+        el.onclick = () => selectNode(node.node_id);
+        el.innerHTML = `
+          <div class="node-header">
+            <div class="node-alias">${escapeHtml(node.alias || 'unnamed')}</div>
+            <div class="node-id-short">${node.node_id.slice(0, 8)}...</div>
+          </div>
+          <div class="node-status">
+            <span class="status-pill ${node.status}">${node.status}</span>
+            <span style="font-size:0.6rem; color:var(--text-dim)">${node.is_local ? 'LOCAL' : 'PEER'}</span>
+          </div>
+          <div class="node-mini-stats">
+            <div class="mini-bar"><div class="mini-bar-track"><div class="mini-bar-fill cpu"></div></div>CPU</div>
+            <div class="mini-bar"><div class="mini-bar-track"><div class="mini-bar-fill mem"></div></div>MEM</div>
+            <div class="mini-bar"><div class="mini-bar-track"><div class="mini-bar-fill disk"></div></div>DISK</div>
+          </div>
+        `;
       }
-      // Update id if the container was recreated (same name, new id).
-      el.dataset.id = c.id || el.dataset.id;
-      const next = prevEl ? prevEl.nextSibling : ctnHost.firstChild;
-      if (el !== next) ctnHost.insertBefore(el, next);
+      const next = prevEl ? prevEl.nextSibling : fleetView.firstChild;
+      if (el !== next) fleetView.insertBefore(el, next);
       prevEl = el;
 
-      // Summary row (always-visible metrics)
-      const statusClass =
-        c.health === 'unhealthy' ? 'unhealthy' :
-        c.status === 'running' ? 'running' : 'exited';
-      el.querySelector('.img').textContent = (c.image || '').slice(0, 32);
-      el.querySelector('.name').textContent = c.name;
-      const statusEl = el.querySelector('.status');
-      statusEl.className = 'status ' + statusClass;
-      statusEl.textContent = (c.status || '?') + (c.health ? ' · ' + c.health : '');
-      const statEl = el.querySelector('.stat');
-      if (c.status === 'running' && c.cpu_percent != null) {
-        statEl.style.display = '';
-        statEl.textContent =
-          'CPU ' + fmtPct(c.cpu_percent) +
-          '   MEM ' + Math.round((c.mem_usage_bytes || 0) / 1048576) + 'M';
-      } else {
-        statEl.style.display = 'none';
-      }
+      const stats = node.last_stats || {};
+      el.querySelector('.mini-bar-fill.cpu').style.width = (stats.cpu_percent || 0) + '%';
+      el.querySelector('.mini-bar-fill.mem').style.width = (stats.mem_percent || 0) + '%';
+      el.querySelector('.mini-bar-fill.disk').style.width = (stats.disk_percent || 0) + '%';
 
-      // Detail rows (fresh every poll regardless of open/closed state — the
-      // <details> element keeps its `open` attr untouched).
-      setText(el.querySelector('.d-image'), c.image || '—');
-      setText(el.querySelector('.d-id'), c.id || '—');
-      setText(el.querySelector('.d-cmd'), c.command || '—');
-      setText(el.querySelector('.d-created'), fmtAgo(c.created_at));
-      setText(el.querySelector('.d-started'),
-        c.uptime_seconds != null ? fmtUptime(c.uptime_seconds) : '—');
-      setText(el.querySelector('.d-restarts'), String(c.restart_count ?? 0));
-      setText(el.querySelector('.d-net'),
-        '↓ ' + fmtBytes(c.net_rx_bytes) + '   ↑ ' + fmtBytes(c.net_tx_bytes));
-      setText(el.querySelector('.d-blk'),
-        'r ' + fmtBytes(c.block_read_bytes) + '   w ' + fmtBytes(c.block_write_bytes));
-      const memTxt =
-        (c.mem_limit_bytes && c.mem_limit_bytes > 0)
-          ? fmtBytes(c.mem_usage_bytes) + ' / ' + fmtBytes(c.mem_limit_bytes)
-          : fmtBytes(c.mem_usage_bytes);
-      setText(el.querySelector('.d-mem-full'), memTxt);
-
-      const portsEl = el.querySelector('.d-ports');
-      portsEl.innerHTML = (c.ports && c.ports.length)
-        ? c.ports.map((p) => '<span class="chip">' + escapeHtml(p) + '</span>').join('')
-        : '<span style="color:var(--text-dim)">none published</span>';
-
-      const mountsEl = el.querySelector('.d-mounts');
-      mountsEl.innerHTML = (c.mounts && c.mounts.length)
-        ? c.mounts.map((m) => '<span class="chip mount">' + escapeHtml(m) + '</span>').join('')
-        : '<span style="color:var(--text-dim)">none</span>';
-
-      const healthEl = el.querySelector('.d-health');
-      if (c.health) {
-        const cls = (c.health === 'healthy') ? '' : 'health-bad';
-        let txt = c.health;
-        if (c.health_failing_streak > 0) txt += '  · failing streak ' + c.health_failing_streak;
-        let html = '<span class="' + cls + '">' + escapeHtml(txt) + '</span>';
-        if (c.health_last_output) {
-          html += '<div style="margin-top:4px;color:var(--text-muted);white-space:pre-wrap;">'
-                + escapeHtml(c.health_last_output) + '</div>';
-        }
-        healthEl.innerHTML = html;
-      } else {
-        healthEl.innerHTML = '<span style="color:var(--text-dim)">no healthcheck</span>';
-      }
+      const statusEl = el.querySelector('.status-pill');
+      statusEl.className = 'status-pill ' + node.status;
+      statusEl.textContent = node.status;
+      el.querySelector('.node-alias').textContent = escapeHtml(node.alias || 'unnamed');
     }
-    for (const [name, el] of existing) {
-      if (!seen.has(name)) {
-        logState.delete(el.dataset.id);
-        el.remove();
-      }
+
+    for (const [id, el] of existing) if (!seen.has(id)) el.remove();
+  }
+
+  function paintDetails() {
+    if (!selectedNodeId) return;
+    const node = nodes.find(n => n.node_id === selectedNodeId);
+    if (!node) { showFleet(); return; }
+
+    setText($('detail-node-name'), node.alias || 'Unnamed Node');
+    setText($('detail-node-id'), node.node_id);
+
+    setText(dtUp24, fmtPct(node.uptime_24h));
+    dtUp24.className = 'v ' + upClass(node.uptime_24h);
+    setText(dtSeen, node.last_seen || 'active');
+    setText(dtRtt, node.rtt || '—');
+    setText(dtSync, node.sync_status || 'live');
+
+    const s = node.last_stats;
+    if (s) {
+      setWidth(barCpu, s.cpu_percent);
+      setWidth(barMem, s.mem_percent);
+      setWidth(barDisk, s.disk_percent);
+      setText(valCpu, fmtPct(s.cpu_percent));
+      setText(valMem, fmtPct(s.mem_percent));
+      setText(valDisk, fmtPct(s.disk_percent));
+
+      setText(mHost, s.hostname || '—');
+      setText(mLoad, [s.load_avg_1m, s.load_avg_5m, s.load_avg_15m].map(v => fmtNum(v)).join(' / '));
+      setText(mProcs, s.process_count != null ? String(s.process_count) : '—');
+      setText(mTemp, s.cpu_temp != null ? fmtNum(s.cpu_temp, 1) + '°C' : '—');
+      setText(mRx, fmtMB(s.net_recv_bytes));
+      setText(mTx, fmtMB(s.net_sent_bytes));
     }
+
+    paintProcesses(node);
+    paintContainers(node);
+    paintChart(node);
   }
 
-  function onContainerToggle(ev) {
-    const el = ev.currentTarget;
-    if (!el.open) return;
-    // Fetch logs on first expand or when stale.
-    fetchContainerLogs(el, /*force=*/false);
-  }
-
-  async function fetchContainerLogs(el, force) {
-    const id = el.dataset.id;
-    if (!id) return;
-    const logsEl = el.querySelector('.ctn-logs');
-    const now = Date.now();
-    const state = logState.get(id) || { lastFetchTs: 0, pending: false };
-    if (state.pending) return;
-    if (!force && (now - state.lastFetchTs) < LOG_REFRESH_MS && logsEl.dataset.loaded === '1') return;
-
-    state.pending = true;
-    logState.set(id, state);
-    logsEl.classList.add('placeholder');
-    logsEl.classList.remove('error');
-    setText(logsEl, 'loading logs …');
-    try {
-      const r = await fetch('/api/container/' + encodeURIComponent(id) + '/logs?tail=20', { cache: 'no-store' });
-      if (!r.ok) {
-        const body = await r.json().catch(() => ({}));
-        throw new Error(body.error || ('HTTP ' + r.status));
-      }
-      const data = await r.json();
-      logsEl.classList.remove('placeholder');
-      logsEl.textContent = (data.logs && data.logs.trim()) ? data.logs : '(no log output)';
-      logsEl.dataset.loaded = '1';
-      logState.set(id, { lastFetchTs: Date.now(), pending: false });
-      logsEl.scrollTop = logsEl.scrollHeight;
-    } catch (err) {
-      logsEl.classList.remove('placeholder');
-      logsEl.classList.add('error');
-      logsEl.textContent = 'failed: ' + (err && err.message || 'unknown');
-      logState.set(id, { lastFetchTs: 0, pending: false });
-    }
-  }
-
-  // ── Processes: diff-by-pid, client-side sort + slice ─────────────────
-  function renderProcesses(d) {
-    lastProcesses = d.processes || [];
-    paintProcesses();
-  }
-
-  function paintProcesses() {
+  function paintProcesses(node) {
+    const procs = (node.last_stats && node.last_stats.processes) || [];
     const sortKey = procSort.value;
     const limit = parseInt(procLimit.value, 10) || 20;
-    if (!lastProcesses.length) {
+
+    if (!procs.length) {
       procTable.style.display = 'none';
-      procEmpty.style.display = '';
-      procBody.innerHTML = '';
-      setText(procSummary, '');
+      procEmpty.style.display = 'block';
       return;
     }
+    procTable.style.display = 'table';
     procEmpty.style.display = 'none';
-    procTable.style.display = '';
 
-    // Sort a copy so the global cache isn't mutated.
-    const sorted = lastProcesses.slice();
+    const sorted = procs.slice();
     if (sortKey === 'cpu') sorted.sort((a, b) => b.cpu_percent - a.cpu_percent);
     else if (sortKey === 'mem') sorted.sort((a, b) => b.mem_percent - a.mem_percent);
     else if (sortKey === 'rss') sorted.sort((a, b) => b.mem_rss_bytes - a.mem_rss_bytes);
     else if (sortKey === 'pid') sorted.sort((a, b) => a.pid - b.pid);
-    const visible = sorted.slice(0, limit);
 
+    const visible = sorted.slice(0, limit);
     const existing = new Map();
     for (const row of procBody.children) existing.set(row.dataset.pid, row);
     const seen = new Set();
     let prevRow = null;
+
     let totalCpu = 0, totalMem = 0;
-    for (const p of lastProcesses) {
-      totalCpu += (p.cpu_percent || 0);
-      totalMem += (p.mem_percent || 0);
-    }
+    for (const p of procs) { totalCpu += (p.cpu_percent || 0); totalMem += (p.mem_percent || 0); }
 
     for (const p of visible) {
       const pidKey = String(p.pid);
@@ -913,15 +781,7 @@ footer.foot {
       if (!row) {
         row = document.createElement('tr');
         row.dataset.pid = pidKey;
-        row.innerHTML =
-          '<td class="num pid"></td>' +
-          '<td class="user"></td>' +
-          '<td class="num c-cpu"></td>' +
-          '<td class="num c-mem"></td>' +
-          '<td class="num c-rss"></td>' +
-          '<td class="num c-thr"></td>' +
-          '<td class="c-state"></td>' +
-          '<td class="cmd" title=""></td>';
+        row.innerHTML = `<td class="num pid"></td><td class="user"></td><td class="num c-cpu"></td><td class="num c-mem"></td><td class="num c-rss"></td><td class="num c-thr"></td><td class="c-state"></td><td class="cmd"></td>`;
       }
       const next = prevRow ? prevRow.nextSibling : procBody.firstChild;
       if (row !== next) procBody.insertBefore(row, next);
@@ -929,140 +789,129 @@ footer.foot {
 
       setText(row.querySelector('.pid'), String(p.pid));
       setText(row.querySelector('.user'), p.username || '—');
-
       const cpuEl = row.querySelector('.c-cpu');
       cpuEl.textContent = fmtPct(p.cpu_percent);
       cpuEl.className = 'num c-cpu ' + ((p.cpu_percent || 0) > 5 ? 'cpu-hot' : 'cpu-cold');
-
       const memEl = row.querySelector('.c-mem');
       memEl.textContent = fmtPct(p.mem_percent);
-      memEl.className = 'num c-mem ' + ((p.mem_percent || 0) > 5 ? 'mem-hot' : 'mem-cold');
-
       setText(row.querySelector('.c-rss'), fmtBytes(p.mem_rss_bytes));
       setText(row.querySelector('.c-thr'), String(p.threads));
-
-      const stateEl = row.querySelector('.c-state');
-      stateEl.className = 'c-state state-' + (p.status || 'unknown');
-      stateEl.textContent = p.status || '—';
-
-      const cmdEl = row.querySelector('.cmd');
+      setText(row.querySelector('.c-state'), p.status || '—');
       const cmd = p.cmdline && p.cmdline.length ? p.cmdline : p.name;
+      const cmdEl = row.querySelector('.cmd');
       cmdEl.textContent = cmd;
       cmdEl.title = cmd;
     }
-    for (const [pid, row] of existing) {
-      if (!seen.has(pid)) row.remove();
-    }
-
-    setText(procSummary,
-      lastProcesses.length + ' procs · ' +
-      'σ CPU ' + fmtPct(totalCpu) + ' · σ MEM ' + fmtPct(totalMem)
-    );
+    for (const [pid, row] of existing) if (!seen.has(pid)) row.remove();
+    setText(procSummary, `${procs.length} procs · σ CPU ${fmtPct(totalCpu)} · σ MEM ${fmtPct(totalMem)}`);
   }
 
-  function renderPeers(d) {
-    const peers = d.peers || [];
-    if (!peers.length) {
-      peersTable.style.display = 'none';
-      peersEmpty.style.display = '';
-      peersBody.innerHTML = '';
+  function paintContainers(node) {
+    const list = (node.last_stats && node.last_stats.containers) || [];
+    if (!list.length) {
+      ctnHost.innerHTML = '';
+      ctnEmpty.style.display = 'block';
       return;
     }
-    peersTable.style.display = '';
-    peersEmpty.style.display = 'none';
+    ctnEmpty.style.display = 'none';
 
-    // Diff-by-node-id: same idempotent strategy as containers.
     const existing = new Map();
-    for (const row of peersBody.children) existing.set(row.dataset.nid, row);
+    for (const el of ctnHost.children) existing.set(el.dataset.name, el);
     const seen = new Set();
-    let prevRow = null;
-    for (const p of peers) {
-      seen.add(p.node_id);
-      let row = existing.get(p.node_id);
-      if (!row) {
-        row = document.createElement('tr');
-        row.dataset.nid = p.node_id;
-        row.innerHTML =
-          '<td class="c-alias"></td>' +
-          '<td class="c-status"></td>' +
-          '<td class="c-sync"></td>' +
-          '<td class="c-rtt"></td>' +
-          '<td class="c-uptime"></td>' +
-          '<td class="c-seen"></td>' +
-          '<td class="c-tags"></td>';
+    let prevEl = null;
+
+    for (const c of list) {
+      seen.add(c.name);
+      let el = existing.get(c.name);
+      if (!el) {
+        el = document.createElement('details');
+        el.className = 'ctn';
+        el.dataset.name = c.name;
+        el.dataset.id = c.id || '';
+        el.innerHTML = `
+          <summary>
+            <div class="img"></div><div class="name"></div><div class="status"></div><div class="stat"></div>
+          </summary>
+          <div class="ctn-detail">
+            <div class="kv"><span class="k">image</span><span class="v d-image"></span></div>
+            <div class="kv"><span class="k">id</span><span class="v d-id"></span></div>
+            <div class="kv"><span class="k">started</span><span class="v d-started"></span></div>
+            <div class="kv"><span class="k">network</span><span class="v d-net"></span></div>
+            <div class="kv"><span class="k">memory</span><span class="v d-mem-full"></span></div>
+            <div class="kv"><span class="k">ports</span><span class="v d-ports"></span></div>
+            <div class="kv"><span class="k">health</span><span class="v d-health"></span></div>
+            <div class="ctn-logs-host">
+              <div class="head"><span>recent logs</span><button class="btn ctn-log-refresh" type="button">[Refresh]</button></div>
+              <pre class="ctn-logs placeholder">expand to pull logs over iroh</pre>
+            </div>
+          </div>`;
+        el.addEventListener('toggle', () => { if (el.open) fetchLogs(node.node_id, el); });
+        el.querySelector('.ctn-log-refresh').onclick = (e) => { e.stopPropagation(); fetchLogs(node.node_id, el, true); };
       }
-      const next = prevRow ? prevRow.nextSibling : peersBody.firstChild;
-      if (row !== next) peersBody.insertBefore(row, next);
-      prevRow = row;
+      const next = prevEl ? prevEl.nextSibling : ctnHost.firstChild;
+      if (el !== next) ctnHost.insertBefore(el, next);
+      prevEl = el;
 
-      row.querySelector('.c-alias').innerHTML =
-        '<span class="peer-alias">' + escapeHtml(p.alias || '—') + '</span>' +
-        '<span class="peer-id">' + escapeHtml(p.node_id.slice(0, 16)) + '…</span>';
+      el.querySelector('.img').textContent = (c.image || '').slice(0, 32);
+      el.querySelector('.name').textContent = c.name;
+      const statusEl = el.querySelector('.status');
+      statusEl.className = 'status ' + (c.health === 'unhealthy' ? 'unhealthy' : c.status === 'running' ? 'running' : 'exited');
+      statusEl.textContent = (c.status || '?') + (c.health ? ' · ' + c.health : '');
 
-      let pillCls, pillTxt;
-      if (p.in_maint)              { pillCls = 'maint';   pillTxt = '◐ MAINT'; }
-      else if (p.status === 'ALIVE')     { pillCls = 'alive';   pillTxt = '● ALIVE'; }
-      else if (p.status === 'DEAD')      { pillCls = 'dead';    pillTxt = '● DEAD'; }
-      else if (p.status === 'UNREACHABLE'){ pillCls = 'unreach'; pillTxt = '◌ UNREACH'; }
-      else                                { pillCls = 'unknown'; pillTxt = '○ UNKNOWN'; }
-      row.querySelector('.c-status').innerHTML =
-        '<span class="pill ' + pillCls + '">' + pillTxt + '</span>';
-
-      row.querySelector('.c-sync').innerHTML =
-        '<span class="sync-tag ' + escapeHtml(p.sync_status || '') + '">' + escapeHtml(p.sync_status || '—') + '</span>';
-
-      row.querySelector('.c-rtt').textContent = p.rtt || '—';
-
-      const u = p.uptime_24h;
-      const uptimeEl = row.querySelector('.c-uptime');
-      uptimeEl.className = 'c-uptime ' + upClass(u);
-      uptimeEl.textContent = u == null ? '—' : fmtPct(u);
-
-      row.querySelector('.c-seen').textContent = p.last_seen || '—';
-      row.querySelector('.c-tags').innerHTML = (p.tags && p.tags.length)
-        ? p.tags.split(/\\s*,\\s*/).map((t) => '<span class="tag-pill">' + escapeHtml(t) + '</span>').join('')
-        : '<span style="color:var(--text-dim)">—</span>';
+      setText(el.querySelector('.d-image'), c.image || '—');
+      setText(el.querySelector('.d-id'), c.id || '—');
+      setText(el.querySelector('.d-started'), c.uptime_seconds != null ? fmtUptime(c.uptime_seconds) : '—');
+      setText(el.querySelector('.d-net'), '↓ ' + fmtBytes(c.net_rx_bytes) + ' ↑ ' + fmtBytes(c.net_tx_bytes));
+      setText(el.querySelector('.d-mem-full'), fmtBytes(c.mem_usage_bytes) + (c.mem_limit_bytes ? ' / ' + fmtBytes(c.mem_limit_bytes) : ''));
+      el.querySelector('.d-ports').innerHTML = (c.ports || []).map(p => `<span class="chip">${escapeHtml(p)}</span>`).join('') || '—';
+      el.querySelector('.d-health').innerHTML = c.health ? `<span class="${c.health === 'healthy' ? '' : 'health-bad'}">${c.health}</span>` : '—';
     }
-    for (const [nid, row] of existing) {
-      if (!seen.has(nid)) row.remove();
+    for (const [name, el] of existing) if (!seen.has(name)) el.remove();
+  }
+
+  async function fetchLogs(nid, el, force = false) {
+    const cid = el.dataset.id;
+    const logsEl = el.querySelector('.ctn-logs');
+    if (!force && logsEl.dataset.loaded === '1') return;
+    logsEl.textContent = 'Pulling logs from host...';
+    logsEl.classList.add('placeholder');
+    try {
+      const r = await fetch(`/api/node/${nid}/container/${cid}/logs?tail=20`);
+      const data = await r.json();
+      if (data.error) throw new Error(data.error);
+      logsEl.textContent = data.logs || '(no logs)';
+      logsEl.classList.remove('placeholder');
+      logsEl.dataset.loaded = '1';
+    } catch (err) {
+      logsEl.textContent = 'Error: ' + err.message;
+      logsEl.classList.add('error');
     }
   }
 
-  // ── Chart (Plotly, updated via react() so it doesn't rebuild) ──────
-  const _chartLayout = {
-    paper_bgcolor: 'transparent',
-    plot_bgcolor: 'transparent',
-    margin: { t: 10, b: 30, l: 36, r: 10 },
-    legend: { font: { color: '#948873', size: 10 }, bgcolor: 'transparent', orientation: 'h', y: 1.1 },
-    xaxis: { color: '#605646', gridcolor: 'rgba(255,240,210,0.05)', tickfont: { size: 9 } },
-    yaxis: { color: '#605646', gridcolor: 'rgba(255,240,210,0.05)', tickfont: { size: 9 }, range: [0, 100], ticksuffix: '%' },
-    font:  { family: 'JetBrains Mono, monospace', color: '#948873' },
-    height: 240,
-  };
-  const _chartConfig = { responsive: true, displayModeBar: false };
+  function paintChart(node) {
+    if (typeof Plotly === 'undefined') return;
+    const history = node.stats_history || [];
+    if (!history.length) return;
 
-  function renderChart(d) {
-    if (typeof Plotly === 'undefined' || !d.chart) return;
-    const ts = d.chart.timestamps || [];
-    if (!ts.length) {
-      chartHost.style.opacity = '0.4';
-      return;
-    }
-    chartHost.style.opacity = '1';
+    const ts = history.map(s => s.timestamp || s.ts);
+    const cpu = history.map(s => s.cpu_percent);
+    const mem = history.map(s => s.mem_percent);
+
     const traces = [
-      { x: ts, y: d.chart.cpu || [], name: 'CPU %',
-        line: { color: '#2ac0a8', width: 2 }, fill: 'tozeroy',
-        fillcolor: 'rgba(42,192,168,0.08)', mode: 'lines', type: 'scatter' },
-      { x: ts, y: d.chart.mem || [], name: 'MEM %',
-        line: { color: '#f8a83e', width: 2 }, fill: 'tozeroy',
-        fillcolor: 'rgba(248,168,62,0.08)', mode: 'lines', type: 'scatter' },
+      { x: ts, y: cpu, name: 'CPU %', line: { color: '#2ac0a8', width: 2 }, fill: 'tozeroy', fillcolor: 'rgba(42,192,168,0.08)', mode: 'lines', type: 'scatter' },
+      { x: ts, y: mem, name: 'MEM %', line: { color: '#f8a83e', width: 2 }, fill: 'tozeroy', fillcolor: 'rgba(248,168,62,0.08)', mode: 'lines', type: 'scatter' }
     ];
-    if (!chartReady) {
-      Plotly.newPlot(chartHost, traces, _chartLayout, _chartConfig);
-      chartReady = true;
-    } else {
-      Plotly.react(chartHost, traces, _chartLayout, _chartConfig);
-    }
+    const layout = {
+      paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
+      margin: { t: 10, b: 30, l: 36, r: 10 },
+      legend: { font: { color: '#948873', size: 10 }, bgcolor: 'transparent', orientation: 'h', y: 1.1 },
+      xaxis: { color: '#605646', gridcolor: 'rgba(255,240,210,0.05)', tickfont: { size: 9 } },
+      yaxis: { color: '#605646', gridcolor: 'rgba(255,240,210,0.05)', tickfont: { size: 9 }, range: [0, 100], ticksuffix: '%' },
+      font: { family: 'JetBrains Mono, monospace', color: '#948873' },
+      height: 240,
+    };
+    if (!chartReady) { Plotly.newPlot(chartHost, traces, layout, { responsive: true, displayModeBar: false }); chartReady = true; }
+    else { Plotly.react(chartHost, traces, layout, { responsive: true, displayModeBar: false }); }
   }
 
   // ── Polling ─────────────────────────────────────────────────────────
@@ -1071,70 +920,49 @@ footer.foot {
     inFlight = true;
     try {
       const r = await fetch('/api/dashboard', { cache: 'no-store' });
-      if (!r.ok) throw new Error('HTTP ' + r.status);
       const d = await r.json();
-      lastOkAt = Date.now();
+      ownNodeId = d.node_id;
+      setText(roleVal, d.role);
+      setText(nodeVal, ownNodeId.slice(0, 12) + '...' + ownNodeId.slice(-4));
 
-      setText(roleVal, d.role || '—');
-      const nid = d.node_id || '';
-      setText(nodeVal, nid ? (nid.slice(0, 12) + '…' + nid.slice(-4)) : '—');
+      // Build unified nodes list
+      nodes = [
+        {
+          node_id: d.node_id,
+          alias: 'local-node',
+          status: 'ALIVE',
+          is_local: true,
+          last_stats: d.own_stats,
+          stats_history: d.chart ? d.chart.timestamps.map((ts, i) => ({
+            ts, cpu_percent: d.chart.cpu[i], mem_percent: d.chart.mem[i]
+          })) : [],
+          uptime_24h: d.avg_uptime_24h,
+          sync_status: 'live',
+        },
+        ...d.peers.map(p => ({ ...p, is_local: false }))
+      ];
 
-      renderFleet(d);
-      renderSystem(d);
-      renderProcesses(d);
-      renderContainers(d);
-      renderPeers(d);
-      renderChart(d);
+      paintFleet();
+      if (selectedNodeId) paintDetails();
 
-      setLiveState('ok', 'live · updated ' + new Date(d.now || Date.now()).toLocaleTimeString());
+      statusText.textContent = 'live · ' + new Date().toLocaleTimeString();
+      liveDot.className = 'live-dot';
     } catch (err) {
-      setLiveState('stale', 'connection lost: ' + (err && err.message || 'unknown'));
-    } finally {
-      inFlight = false;
-    }
+      statusText.textContent = 'stale: ' + err.message;
+      liveDot.className = 'live-dot stale';
+    } finally { inFlight = false; }
   }
 
   function schedulePolling() {
-    if (pollHandle != null) { clearInterval(pollHandle); pollHandle = null; }
-    if (pollMs > 0) {
-      pollHandle = setInterval(pollOnce, pollMs);
-      setLiveState('ok', 'live · refresh every ' + (pollMs / 1000) + 's');
-    } else {
-      setLiveState('paused', 'paused — click [Refresh] to update manually');
-    }
+    if (pollHandle) clearInterval(pollHandle);
+    if (pollMs > 0) pollHandle = setInterval(pollOnce, pollMs);
   }
 
-  // ── Wiring ──────────────────────────────────────────────────────────
-  intervalEl.value = String(pollMs);
-  intervalEl.addEventListener('change', () => {
-    pollMs = parseInt(intervalEl.value, 10) || 0;
-    localStorage.setItem(POLL_KEY, String(pollMs));
-    schedulePolling();
-    if (pollMs > 0) pollOnce();
-  });
-  refreshBtn.addEventListener('click', () => pollOnce());
+  intervalEl.onchange = () => { pollMs = parseInt(intervalEl.value); localStorage.setItem(POLL_KEY, pollMs); schedulePolling(); pollOnce(); };
+  refreshBtn.onclick = pollOnce;
+  procSort.onchange = () => { localStorage.setItem(PROC_SORT_KEY, procSort.value); if (selectedNodeId) paintDetails(); };
+  procLimit.onchange = () => { localStorage.setItem(PROC_LIMIT_KEY, procLimit.value); if (selectedNodeId) paintDetails(); };
 
-  // Sort/limit controls re-paint from the cached snapshot — no extra fetch.
-  procSort.addEventListener('change', () => {
-    localStorage.setItem(PROC_SORT_KEY, procSort.value);
-    paintProcesses();
-  });
-  procLimit.addEventListener('change', () => {
-    localStorage.setItem(PROC_LIMIT_KEY, procLimit.value);
-    paintProcesses();
-  });
-
-  // Pause polling while the tab is hidden (saves battery + DB pressure).
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden) {
-      if (pollHandle != null) { clearInterval(pollHandle); pollHandle = null; }
-    } else {
-      pollOnce();
-      schedulePolling();
-    }
-  });
-
-  // First paint + start the loop.
   pollOnce();
   schedulePolling();
 })();
@@ -1158,7 +986,6 @@ def _rel(dt: Optional[datetime]) -> str:
         return f"{delta // 60}m ago"
     if delta < 86400:
         return f"{delta // 3600}h ago"
-    return f"{delta // 86400}d ago"
 
 
 # ---------------------------------------------------------------------------
@@ -1239,6 +1066,39 @@ class WebApp:
                 msg = str(exc)
                 status = 404 if "not found" in msg.lower() else 500
                 return jsonify({"error": msg[:300]}), status
+
+        @self._app.route("/api/node/<nid>/container/<cid>/logs")
+        def api_node_container_logs(nid, cid):
+            if not _CONTAINER_REF_RE.match(cid or ""):
+                return jsonify({"error": "invalid container id"}), 400
+            try:
+                tail = int(request.args.get("tail", 20))
+            except (TypeError, ValueError):
+                tail = 20
+            tail = max(1, min(tail, 200))
+
+            # If requesting logs from the local node, use the local collector
+            if nid == engine.node_id:
+                sc = engine.stats_collector
+                client = sc._docker_client if sc is not None else None
+                if client is None:
+                    return jsonify({"error": "docker unavailable"}), 503
+                try:
+                    c = client.containers.get(cid)
+                    raw = c.logs(tail=tail, timestamps=True, stdout=True, stderr=True)
+                    logs = (raw or b"").decode("utf-8", errors="replace")
+                    return jsonify({"id": cid, "logs": logs})
+                except Exception as exc:
+                    return jsonify({"error": str(exc)[:300]}), 500
+
+            # Otherwise, attempt to pull over Iroh LOGS_ALPN
+            try:
+                res = engine.fetch_peer_container_logs(nid, cid, tail=tail)
+                if "error" in res:
+                    return jsonify(res), 500
+                return jsonify(res)
+            except Exception as exc:
+                return jsonify({"error": str(exc)[:300]}), 500
 
         # Bind to localhost only — the dashboard has no auth.
         self._server = make_server("127.0.0.1", self._port, self._app, threaded=True)
@@ -1358,5 +1218,7 @@ class WebApp:
                 "uptime_24h": uptime,
                 "last_seen": _rel(state.last_seen),
                 "tags": ", ".join(trusted.tags) if trusted and trusted.tags else None,
+                "last_stats": state.last_stats,
+                "stats_history": list(state.stats_history) if state.stats_history else [],
             })
         return result

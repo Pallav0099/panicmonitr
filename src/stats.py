@@ -425,6 +425,7 @@ class StatsCollector:
         attrs = [
             "pid", "ppid", "name", "username", "status",
             "memory_percent", "memory_info", "num_threads", "nice", "cmdline",
+            "uids",
         ]
 
         try:
@@ -456,11 +457,32 @@ class StatsCollector:
                     rss = int(getattr(mem_info, "rss", 0) or 0)
                     cmd_parts = info.get("cmdline") or []
                     cmd = " ".join(cmd_parts) if cmd_parts else (info.get("name") or "")
+
+                    # Filter out kernel threads to reduce noise:
+                    # Usually have 0 RSS and no command line.
+                    if rss == 0 and not cmd_parts:
+                        continue
+
+                    # Robust username resolution:
+                    # 1. Map UID 0 to 'root'
+                    # 2. Map other system UIDs (< 1000) to 'system'
+                    # 3. Alias 'nobody' to 'system' as it's usually used for background services
+                    uids = info.get("uids")
+                    username = info.get("username")
+                    uid = uids.real if uids else None
+
+                    if uid == 0:
+                        username = "root"
+                    elif uid is not None and uid < 1000:
+                        username = "system"
+                    elif username == "nobody" or not username:
+                        username = "system" if (uid is not None and uid < 1000) else (username or "unknown")
+
                     rows.append(ProcessInfo(
                         pid=int(info.get("pid") or 0),
                         ppid=int(info.get("ppid") or 0),
                         name=info.get("name") or "",
-                        username=info.get("username") or "",
+                        username=username,
                         status=info.get("status") or "",
                         cpu_percent=round(cpu, 1),
                         mem_percent=round(float(info.get("memory_percent") or 0.0), 2),

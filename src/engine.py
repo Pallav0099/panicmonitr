@@ -46,6 +46,7 @@ STATUS_ALPN = b"panic-monitor/status/0"
 PUSH_ALPN = b"panic-monitor/push/0"
 STATS_GOSSIP_ALPN = b"panic-monitor/stats-gossip/0"
 SYNC_ALPN = b"panic-monitor/sync/0"
+LOGS_ALPN = b"panic-monitor/logs/0"
 PROBE_TIMEOUT_SECONDS = 10
 # `--fetch-dashboard` spins up a fresh iroh node, so cold-start discovery
 # needs more slack than an already-warm daemon probe.
@@ -209,6 +210,92 @@ class StatusProtocolCreator:
 
     def create(self, endpoint):
         return StatusProtocol(self)
+
+
+# ---------------------------------------------------------------------------
+# Slice C2: Container logs ALPN  (panic-monitor/logs/0)
+#
+# A peer we granted ``view_dashboard`` can request a tail of logs for a
+# specific container.
+# ---------------------------------------------------------------------------
+
+class ContainerLogsProtocol:
+    """Accepts inbound container log requests."""
+
+    def __init__(self, creator: "ContainerLogsProtocolCreator") -> None:
+        self._creator = creator
+
+    @property
+    def _trust(self) -> PeerTrustManager:
+        return self._creator._trust
+
+    @property
+    def _engine(self):
+        return self._creator._engine
+
+    async def accept(self, conn) -> None:
+        remote = conn.remote_node_id()
+        logger.debug("[logs.accept] incoming from {}", remote[:12])
+        ok, reason = self._trust.verify_and_authorize(remote, "view_dashboard")
+        if not ok:
+            logger.warning("[logs.accept] rejected from {}: {}", remote[:12], reason)
+            conn.close(403, reason.encode()[:120])
+            return
+
+        try:
+            bi = await asyncio.wait_for(conn.accept_bi(), timeout=10)
+            recv_stream = bi.recv()
+            send_stream = bi.send()
+        except Exception as exc:
+            logger.warning("[logs.accept] stream open failed: {}", exc)
+            conn.close(500, b"stream error")
+            return
+
+        engine = self._engine
+        if engine is None:
+            conn.close(500, b"engine not ready")
+            return
+
+        try:
+            req_bytes = await asyncio.wait_for(_read_framed(recv_stream, 1024), timeout=10)
+            req = json.loads(req_bytes.decode("utf-8"))
+            cid = req.get("cid")
+            tail = int(req.get("tail", 20))
+
+            sc = engine._stats_collector
+            client = sc._docker_client if sc is not None else None
+            if client is None:
+                payload = json.dumps({"error": "docker unavailable"}).encode("utf-8")
+                await _write_framed(send_stream, payload)
+                await send_stream.finish()
+                return
+
+            try:
+                c = client.containers.get(cid)
+                raw = c.logs(tail=tail, timestamps=True, stdout=True, stderr=True)
+                logs = (raw or b"").decode("utf-8", errors="replace")
+                payload = json.dumps({"logs": logs}).encode("utf-8")
+            except Exception as exc:
+                payload = json.dumps({"error": str(exc)}).encode("utf-8")
+
+            await _write_framed(send_stream, payload)
+            await send_stream.finish()
+        except Exception as exc:
+            logger.error("[logs.accept] failed: {}", exc)
+        conn.close(0, b"done")
+
+    async def shutdown(self) -> None:
+        logger.debug("Container logs protocol shutting down")
+
+
+class ContainerLogsProtocolCreator:
+    def __init__(self, trust: PeerTrustManager) -> None:
+        self._trust = trust
+        self._net = None
+        self._engine = None
+
+    def create(self, endpoint):
+        return ContainerLogsProtocol(self)
 
 
 # ---------------------------------------------------------------------------
@@ -471,11 +558,13 @@ class MonitorEngine:
         status_creator = StatusProtocolCreator(self._trust)
         push_creator = PushProtocolCreator(self._trust)
         sync_creator = SyncProtocolCreator(self._trust)
+        logs_creator = ContainerLogsProtocolCreator(self._trust)
         options.protocols = {
             HEARTBEAT_ALPN: hb_creator,
             STATUS_ALPN: status_creator,
             PUSH_ALPN: push_creator,
             SYNC_ALPN: sync_creator,
+            LOGS_ALPN: logs_creator,
         }
 
         self._iroh = await iroh.Iroh.memory_with_options(options)
@@ -485,6 +574,7 @@ class MonitorEngine:
         push_creator._net = self._iroh.net()
         push_creator._engine = self
         sync_creator._engine = self
+        logs_creator._engine = self
         logger.debug("[init] iroh node created, net ref wired to protocol handlers")
 
         iroh_node_id = await self._iroh.net().node_id()
@@ -736,6 +826,11 @@ class MonitorEngine:
                     ),
                     timeout=PROBE_TIMEOUT_SECONDS,
                 )
+                # Force handshake to complete by awaiting the remote node ID.
+                # endpoint.connect() can return a lazy handle; this ensures the
+                # remote peer actually responded to the QUIC handshake + ALPN.
+                await asyncio.wait_for(conn.remote_node_id(), timeout=5)
+
             rtt_us = conn.rtt()
             rtt_ms = rtt_us / 1000.0 if rtt_us else None
 
@@ -751,7 +846,14 @@ class MonitorEngine:
                 label, rtt_ms or 0, peer.consecutive_successes,
             )
 
-            await _log_conn_type(self._iroh.net(), peer.entry.node_id, label, "probe")
+            # Query connection type with a short timeout to prevent cycle hangs.
+            try:
+                await asyncio.wait_for(
+                    _log_conn_type(self._iroh.net(), peer.entry.node_id, label, "probe"),
+                    timeout=5
+                )
+            except Exception: # noqa: BLE001
+                pass
 
         except Exception as exc:
             record = LatencyRecord(
@@ -1377,6 +1479,42 @@ class MonitorEngine:
                 conn.close(0, b"done")
             except Exception:  # noqa: BLE001 S110
                 pass  # best-effort conn cleanup
+
+    async def fetch_peer_container_logs(self, target: str, cid: str, tail: int = 20) -> dict:
+        """Pull container logs from a peer over LOGS_ALPN."""
+        if self._iroh is None:
+            raise RuntimeError("engine not initialized")
+        target_node_id, err = self._trust.resolve_target(target)
+        if err is not None:
+            raise ValueError(err)
+        assert target_node_id is not None
+
+        try:
+            pub_key = iroh.PublicKey.from_string(target_node_id)
+        except iroh.iroh_ffi.IrohError as exc:
+            raise ValueError(f"invalid node_id: {exc}")
+        addr = iroh.NodeAddr(pub_key, None, [])
+        endpoint = self._iroh.node().endpoint()
+        conn = await asyncio.wait_for(
+            endpoint.connect(addr, LOGS_ALPN), timeout=FETCH_TIMEOUT_SECONDS
+        )
+        try:
+            bi = await asyncio.wait_for(conn.open_bi(), timeout=FETCH_TIMEOUT_SECONDS)
+            send_stream = bi.send()
+            recv_stream = bi.recv()
+            request_body = json.dumps({"cid": cid, "tail": tail}).encode("utf-8")
+            await _write_framed(send_stream, request_body)
+            await send_stream.finish()
+            payload = await asyncio.wait_for(
+                _read_framed(recv_stream, 4 * 1024 * 1024),  # 4 MiB max logs
+                timeout=FETCH_TIMEOUT_SECONDS,
+            )
+            return json.loads(payload.decode("utf-8"))
+        finally:
+            try:
+                conn.close(0, b"done")
+            except Exception:  # noqa: BLE001 S110
+                pass
 
     async def _run_heartbeat_cycle(self) -> None:
         """Probe all monitor targets concurrently and log a summary."""
