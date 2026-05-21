@@ -108,6 +108,29 @@ class HistoryStore:
                 (node_id, _to_epoch(ts), rtt_ms, status.value),
             )
 
+    def record_many(
+        self,
+        rows: list[tuple[str, datetime, float | None, PeerStatus]],
+    ) -> None:
+        """Insert multiple probe rows in one explicit transaction."""
+        if not rows:
+            return
+        values = [
+            (node_id, _to_epoch(ts), rtt_ms, status.value)
+            for node_id, ts, rtt_ms, status in rows
+        ]
+        with self._lock:
+            self._conn.execute("BEGIN")
+            try:
+                self._conn.executemany(
+                    "INSERT INTO probes (node_id, ts, rtt_ms, status) VALUES (?, ?, ?, ?)",
+                    values,
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
     def prune_older_than(self, cutoff: datetime | None = None) -> int:
         """Delete rows older than *cutoff*. Returns rows deleted."""
         if cutoff is None:
@@ -234,23 +257,27 @@ class HistoryStore:
         ``None`` means no probes fell in that bucket.
         """
         now = datetime.now(IST)
-        start = now - timedelta(hours=hours)
+        now_epoch = _to_epoch(now)
+        current_hour_start = (now_epoch // 3600) * 3600
+        start_hour = current_hour_start - ((hours - 1) * 3600)
+        end_exclusive = current_hour_start + 3600
         buckets: list[float | None] = [None] * hours
         with self._lock:
             cur = self._conn.execute(
                 """
                 SELECT
-                    CAST((? - ts) / 3600 AS INTEGER) AS age_h,
+                    CAST(ts / 3600 AS INTEGER) AS hour_idx,
                     SUM(CASE WHEN status = 'ALIVE' THEN 1 ELSE 0 END) AS ok,
                     COUNT(*) AS total
                 FROM probes
-                WHERE node_id = ? AND ts >= ? AND ts <= ?
-                GROUP BY age_h
+                WHERE node_id = ? AND ts >= ? AND ts < ?
+                GROUP BY hour_idx
                 """,
-                (_to_epoch(now), node_id, _to_epoch(start), _to_epoch(now)),
+                (node_id, start_hour, end_exclusive),
             )
-            for age_h, ok, total in cur.fetchall():
-                idx = hours - 1 - int(age_h)
+            for hour_idx, ok, total in cur.fetchall():
+                hour_start = int(hour_idx) * 3600
+                idx = int((hour_start - start_hour) // 3600)
                 if 0 <= idx < hours and total:
                     buckets[idx] = 100.0 * (ok or 0) / total
         return buckets

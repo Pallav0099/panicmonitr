@@ -88,17 +88,24 @@ def _derive_node_id(seed: bytes) -> str:
 def _atomic_write_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_bytes(data)
-    os.chmod(tmp, mode)
-    tmp.replace(path)
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            os.fchmod(f.fileno(), mode)
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _atomic_write_text(path: Path, data: str, mode: int = 0o600) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(data)
-    os.chmod(tmp, mode)
-    tmp.replace(path)
+    _atomic_write_bytes(path, data.encode("utf-8"), mode=mode)
 
 
 def _seal(seed: bytes, password: str, key_path: Path, meta_path: Path) -> IdentityMeta:
@@ -226,5 +233,4 @@ def reset_password(
     meta = _seal(seed, new_password, key_path, meta_path)
     logger.info("Identity re-sealed under new password")
     return meta
-
 

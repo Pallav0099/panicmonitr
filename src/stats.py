@@ -120,10 +120,7 @@ class SystemSnapshot:
     processes: list[ProcessInfo] = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        d = asdict(self)
-        d["containers"] = [c for c in d["containers"]]
-        d["processes"] = [p for p in d["processes"]]
-        return d
+        return asdict(self)
 
 
 # ---------------------------------------------------------------------------
@@ -280,12 +277,7 @@ class StatsCollector:
                 # diagnostic that bloats the JSON payload.
                 health_last_output = out[:400] if isinstance(out, str) else None
 
-            host_cfg = attrs.get("HostConfig", {}) or {}
-            restart_count = (
-                host_cfg.get("RestartCount", 0)
-                or attrs.get("RestartCount", 0)
-                or 0
-            )
+            restart_count = int(state.get("RestartCount") or 0)
 
             created = attrs.get("Created", "")
             if created and created != "0001-01-01T00:00:00Z":

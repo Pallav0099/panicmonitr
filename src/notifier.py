@@ -105,7 +105,11 @@ class WebhookNotifier(Notifier):
                 return resp.getcode(), resp.read(512).decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             # Non-2xx with a body attached — return the status for logging.
-            body_preview = exc.read(512).decode("utf-8", errors="replace") if exc.fp else ""
+            try:
+                err_body = exc.read() if exc.fp else b""
+            except Exception:  # noqa: BLE001
+                err_body = b""
+            body_preview = err_body.decode("utf-8", errors="replace")[:512]
             return exc.code, body_preview
 
 

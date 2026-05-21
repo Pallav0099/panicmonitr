@@ -298,18 +298,21 @@ class PeerTrustManager:
     # Tags (Slice C)
     # ------------------------------------------------------------------
 
-    def set_tags(self, node_id: str, tags: list[str]) -> bool:
+    def _set_tags_locked(self, node_id: str, tags: list[str]) -> bool:
         normalized = sorted({t.strip() for t in tags if t.strip()})
-        with self._lock:
-            peer = self._peers_by_nid.get(node_id)
-            if peer is None:
-                logger.warning("Peer {} not in trust store", node_id[:12])
-                return False
-            self._log.append(OP_SET_TAGS, {"node_id": node_id, "tags": normalized})
-            self._rebuild_from_log()
-            self._save_cache()
+        peer = self._peers_by_nid.get(node_id)
+        if peer is None:
+            logger.warning("Peer {} not in trust store", node_id[:12])
+            return False
+        self._log.append(OP_SET_TAGS, {"node_id": node_id, "tags": normalized})
+        self._rebuild_from_log()
+        self._save_cache()
         logger.info("Tags for {} set to {}", node_id[:12], normalized)
         return True
+
+    def set_tags(self, node_id: str, tags: list[str]) -> bool:
+        with self._lock:
+            return self._set_tags_locked(node_id, tags)
 
     def add_tag(self, node_id: str, tag: str) -> bool:
         tag = tag.strip()
@@ -322,10 +325,10 @@ class PeerTrustManager:
                 return False
             if tag in peer.tags:
                 return True  # idempotent
-            new_tags = peer.tags + [tag]
-        return self.set_tags(node_id, new_tags)
+            return self._set_tags_locked(node_id, peer.tags + [tag])
 
     def remove_tag(self, node_id: str, tag: str) -> bool:
+        tag = tag.strip()
         with self._lock:
             peer = self._peers_by_nid.get(node_id)
             if peer is None:
@@ -333,7 +336,7 @@ class PeerTrustManager:
             if tag not in peer.tags:
                 return True  # idempotent
             remaining = [t for t in peer.tags if t != tag]
-        return self.set_tags(node_id, remaining)
+            return self._set_tags_locked(node_id, remaining)
 
     def peers_with_tag(self, tag: str) -> list[TrustedPeer]:
         with self._lock:

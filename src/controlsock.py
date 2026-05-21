@@ -20,7 +20,7 @@ import struct
 import threading
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from loguru import logger
 
@@ -239,7 +239,8 @@ class _ControlHandler(http.server.BaseHTTPRequestHandler):
                 err = engine.add_peer_tag(nid, tag)
                 return self._reply(err)
             if method == "DELETE":
-                tag = (urlparse(self.path).query or "").split("tag=")[-1] if "tag=" in (self.path or "") else None
+                qs = parse_qs(urlparse(self.path).query)
+                tag = (qs.get("tag") or [None])[0]
                 if not tag:
                     body = self._read_body() if not body else body
                     tag = body.get("tag")

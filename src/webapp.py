@@ -610,6 +610,7 @@ footer.foot {
 
   const logState = new Map();
   const LOG_REFRESH_MS = 5000;
+  let logRequestSeq = 0;
 
   // ── Helpers ────────────────────────────────────────────────────────
   const fmtPct = (v) => (v == null || isNaN(v)) ? '—' : (Math.round(v * 10) / 10).toFixed(1) + '%';
@@ -649,9 +650,33 @@ footer.foot {
   function setText(el, text) { if (el.textContent !== text) el.textContent = text; }
   function setWidth(el, pct) { el.style.width = Math.max(0, Math.min(100, pct || 0)) + '%'; }
   function escapeHtml(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+  function getNodeId(d) { return (d && (d.node_id || (d.source && d.source.node_id))) || ''; }
+  function logKey(nid, cid) { return nid + ':' + cid; }
+
+  function abortLogRequest(el) {
+    const key = el && el.dataset ? el.dataset.logKey : '';
+    if (!key) return;
+    const state = logState.get(key);
+    if (state) {
+      state.controller.abort();
+      logState.delete(key);
+    }
+    delete el.dataset.logKey;
+    delete el.dataset.logToken;
+  }
+
+  function abortAllLogRequests() {
+    for (const state of logState.values()) state.controller.abort();
+    logState.clear();
+    for (const el of ctnHost.children) {
+      delete el.dataset.logKey;
+      delete el.dataset.logToken;
+    }
+  }
 
   // ── Navigation ──────────────────────────────────────────────────────
   function showFleet() {
+    abortAllLogRequests();
     selectedNodeId = null;
     detailView.style.display = 'none';
     fleetView.style.display = 'grid';
@@ -659,6 +684,7 @@ footer.foot {
   }
 
   function selectNode(nid) {
+    abortAllLogRequests();
     selectedNodeId = nid;
     fleetView.style.display = 'none';
     detailView.style.display = 'flex';
@@ -670,26 +696,33 @@ footer.foot {
 
   // ── Renderers ───────────────────────────────────────────────────────
   function paintFleet() {
+    const visibleNodes = nodes.filter(n => getNodeId(n));
+    if (!visibleNodes.length) {
+      fleetView.innerHTML = '<div class="empty" data-id="__empty">no nodes reported</div>';
+      return;
+    }
     const existing = new Map();
     for (const el of fleetView.children) existing.set(el.dataset.id, el);
     const seen = new Set();
     let prevEl = null;
 
-    for (const node of nodes) {
-      seen.add(node.node_id);
-      let el = existing.get(node.node_id);
+    for (const node of visibleNodes) {
+      const nid = getNodeId(node);
+      const status = node.status || 'UNKNOWN';
+      seen.add(nid);
+      let el = existing.get(nid);
       if (!el) {
         el = document.createElement('div');
         el.className = 'node-card';
-        el.dataset.id = node.node_id;
-        el.onclick = () => selectNode(node.node_id);
+        el.dataset.id = nid;
+        el.onclick = () => selectNode(nid);
         el.innerHTML = `
           <div class="node-header">
             <div class="node-alias">${escapeHtml(node.alias || 'unnamed')}</div>
-            <div class="node-id-short">${node.node_id.slice(0, 8)}...</div>
+            <div class="node-id-short">${nid.slice(0, 8)}...</div>
           </div>
           <div class="node-status">
-            <span class="status-pill ${node.status}">${node.status}</span>
+            <span class="status-pill ${status}">${status}</span>
             <span style="font-size:0.6rem; color:var(--text-dim)">${node.is_local ? 'LOCAL' : 'PEER'}</span>
           </div>
           <div class="node-mini-stats">
@@ -709,9 +742,10 @@ footer.foot {
       el.querySelector('.mini-bar-fill.disk').style.width = (stats.disk_percent || 0) + '%';
 
       const statusEl = el.querySelector('.status-pill');
-      statusEl.className = 'status-pill ' + node.status;
-      statusEl.textContent = node.status;
-      el.querySelector('.node-alias').textContent = escapeHtml(node.alias || 'unnamed');
+      statusEl.className = 'status-pill ' + status;
+      statusEl.textContent = status;
+      el.querySelector('.node-alias').textContent = node.alias || 'unnamed';
+      el.querySelector('.node-id-short').textContent = nid.slice(0, 8) + '...';
     }
 
     for (const [id, el] of existing) if (!seen.has(id)) el.remove();
@@ -719,11 +753,12 @@ footer.foot {
 
   function paintDetails() {
     if (!selectedNodeId) return;
-    const node = nodes.find(n => n.node_id === selectedNodeId);
+    const node = nodes.find(n => getNodeId(n) === selectedNodeId);
     if (!node) { showFleet(); return; }
+    const nid = getNodeId(node);
 
     setText($('detail-node-name'), node.alias || 'Unnamed Node');
-    setText($('detail-node-id'), node.node_id);
+    setText($('detail-node-id'), nid);
 
     setText(dtUp24, fmtPct(node.uptime_24h));
     dtUp24.className = 'v ' + upClass(node.uptime_24h);
@@ -822,7 +857,9 @@ footer.foot {
 
   function paintContainers(node) {
     const list = (node.last_stats && node.last_stats.containers) || [];
+    const nid = getNodeId(node);
     if (!list.length) {
+      abortAllLogRequests();
       ctnHost.innerHTML = '';
       ctnEmpty.style.display = 'block';
       return;
@@ -859,12 +896,29 @@ footer.foot {
               <pre class="ctn-logs placeholder">expand to pull logs over iroh</pre>
             </div>
           </div>`;
-        el.addEventListener('toggle', () => { if (el.open) fetchLogs(node.node_id, el); });
-        el.querySelector('.ctn-log-refresh').onclick = (e) => { e.stopPropagation(); fetchLogs(node.node_id, el, true); };
+        el.addEventListener('toggle', () => {
+          if (el.open) fetchLogs(el.dataset.nodeId, el);
+          else abortLogRequest(el);
+        });
+        el.querySelector('.ctn-log-refresh').onclick = (e) => {
+          e.stopPropagation();
+          fetchLogs(el.dataset.nodeId, el, true);
+        };
       }
       const next = prevEl ? prevEl.nextSibling : ctnHost.firstChild;
       if (el !== next) ctnHost.insertBefore(el, next);
       prevEl = el;
+
+      const cid = c.id || '';
+      if (el.dataset.id !== cid || el.dataset.nodeId !== nid) {
+        abortLogRequest(el);
+        const logsEl = el.querySelector('.ctn-logs');
+        logsEl.textContent = 'expand to pull logs over iroh';
+        logsEl.className = 'ctn-logs placeholder';
+        delete logsEl.dataset.loaded;
+      }
+      el.dataset.id = cid;
+      el.dataset.nodeId = nid;
 
       el.querySelector('.img').textContent = (c.image || '').slice(0, 32);
       el.querySelector('.name').textContent = c.name;
@@ -880,25 +934,52 @@ footer.foot {
       el.querySelector('.d-ports').innerHTML = (c.ports || []).map(p => `<span class="chip">${escapeHtml(p)}</span>`).join('') || '—';
       el.querySelector('.d-health').innerHTML = c.health ? `<span class="${c.health === 'healthy' ? '' : 'health-bad'}">${c.health}</span>` : '—';
     }
-    for (const [name, el] of existing) if (!seen.has(name)) el.remove();
+    for (const [name, el] of existing) {
+      if (!seen.has(name)) {
+        abortLogRequest(el);
+        el.remove();
+      }
+    }
   }
 
   async function fetchLogs(nid, el, force = false) {
+    if (!nid) return;
     const cid = el.dataset.id;
+    if (!cid) return;
     const logsEl = el.querySelector('.ctn-logs');
     if (!force && logsEl.dataset.loaded === '1') return;
+    abortLogRequest(el);
+    const controller = new AbortController();
+    const token = ++logRequestSeq;
+    const key = logKey(nid, cid);
+    logState.set(key, { controller, token, el });
+    el.dataset.logKey = key;
+    el.dataset.logToken = String(token);
     logsEl.textContent = 'Pulling logs from host...';
     logsEl.classList.add('placeholder');
+    logsEl.classList.remove('error');
     try {
-      const r = await fetch(`/api/node/${nid}/container/${cid}/logs?tail=20`);
+      const r = await fetch(`/api/node/${nid}/container/${cid}/logs?tail=20`, { signal: controller.signal });
       const data = await r.json();
+      const state = logState.get(key);
+      if (!state || state.token !== token || state.el !== el || !el.open || el.dataset.id !== cid || el.dataset.nodeId !== nid) return;
       if (data.error) throw new Error(data.error);
       logsEl.textContent = data.logs || '(no logs)';
       logsEl.classList.remove('placeholder');
       logsEl.dataset.loaded = '1';
     } catch (err) {
+      if (err && err.name === 'AbortError') return;
+      const state = logState.get(key);
+      if (!state || state.token !== token || state.el !== el || el.dataset.id !== cid || el.dataset.nodeId !== nid) return;
       logsEl.textContent = 'Error: ' + err.message;
       logsEl.classList.add('error');
+    } finally {
+      const state = logState.get(key);
+      if (state && state.token === token && state.el === el) {
+        logState.delete(key);
+        delete el.dataset.logKey;
+        delete el.dataset.logToken;
+      }
     }
   }
 
@@ -942,14 +1023,13 @@ footer.foot {
     try {
       const r = await fetch('/api/dashboard', { cache: 'no-store' });
       const d = await r.json();
-      ownNodeId = d.node_id;
-      setText(roleVal, d.role);
-      setText(nodeVal, ownNodeId.slice(0, 12) + '...' + ownNodeId.slice(-4));
+      ownNodeId = getNodeId(d);
+      setText(roleVal, d.role || '—');
+      setText(nodeVal, ownNodeId ? ownNodeId.slice(0, 12) + '...' + ownNodeId.slice(-4) : '—');
 
       // Build unified nodes list
-      nodes = [
-        {
-          node_id: d.node_id,
+      const localNode = ownNodeId ? {
+          node_id: ownNodeId,
           alias: 'local-node',
           status: 'ALIVE',
           is_local: true,
@@ -959,9 +1039,12 @@ footer.foot {
           })) : [],
           uptime_24h: d.avg_uptime_24h,
           sync_status: 'live',
-        },
-        ...d.peers.map(p => ({ ...p, is_local: false }))
-      ];
+        } : null;
+      const peers = Array.isArray(d.peers) ? d.peers : [];
+      nodes = [
+        localNode,
+        ...peers.map(p => ({ ...p, node_id: getNodeId(p), is_local: false }))
+      ].filter(n => n && getNodeId(n));
 
       paintFleet();
       if (selectedNodeId) paintDetails();

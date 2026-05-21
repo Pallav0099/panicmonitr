@@ -142,11 +142,7 @@ class TrustLog:
         # incrementally by ``append`` / repopulated by ``load``.
         self._monitor_tail: deque[LogEntry] = deque(maxlen=_MONITOR_EVENT_TAIL)
 
-    def load(self) -> None:
-        if not self._path.exists():
-            logger.info("No trust log at {} -- starting empty", self._path)
-            return
-
+    def _read_verified_entries(self) -> list[LogEntry]:
         entries: list[LogEntry] = []
         raw = self._path.read_text()
         for i, line in enumerate(raw.splitlines()):
@@ -158,12 +154,28 @@ class TrustLog:
             except Exception as exc:
                 raise RuntimeError(f"Invalid log entry at line {i + 1}: {exc}")
             entries.append(entry)
-
         self._verify_chain(entries)
+        return entries
+
+    @staticmethod
+    def _monitor_tail_from(entries: list[LogEntry]) -> deque[LogEntry]:
+        tail: deque[LogEntry] = deque(maxlen=_MONITOR_EVENT_TAIL)
+        for e in entries:
+            if e.type in (OP_MONITOR_DOWN, OP_MONITOR_UP):
+                tail.append(e)
+        return tail
+
+    def load(self) -> None:
+        if not self._path.exists():
+            logger.info("No trust log at {} -- starting empty", self._path)
+            return
+
+        entries = self._read_verified_entries()
+        tail = self._monitor_tail_from(entries)
         with self._lock:
             self._entries = entries
             self._last_mtime = self._path.stat().st_mtime
-            self._rebuild_monitor_tail()
+            self._monitor_tail = tail
         logger.info("Trust log loaded  entries={}", len(entries))
 
     def _rebuild_monitor_tail(self) -> None:
@@ -341,8 +353,10 @@ class TrustLog:
         if mtime <= self._last_mtime:
             return False
         logger.info("log.jsonl changed on disk -- reloading")
+        entries = self._read_verified_entries()
+        tail = self._monitor_tail_from(entries)
         with self._lock:
-            self._entries = []
-            self._monitor_tail.clear()
-        self.load()
+            self._entries = entries
+            self._monitor_tail = tail
+            self._last_mtime = self._path.stat().st_mtime
         return True

@@ -621,6 +621,7 @@ class MonitorEngine:
         self._probe_semaphore: asyncio.Semaphore = asyncio.Semaphore(MAX_CONCURRENT_PROBES)
         self._sync_semaphore: asyncio.Semaphore = asyncio.Semaphore(5)
         self._dashboard_pull_semaphore: asyncio.Semaphore = asyncio.Semaphore(10)
+        self._state_locks: dict[str, asyncio.Lock] = {}
         self._controlsock: ControlSocketServer | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self._started_at: datetime | None = None
@@ -636,6 +637,13 @@ class MonitorEngine:
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+
+    def _state_lock_for(self, node_id: str) -> asyncio.Lock:
+        lock = self._state_locks.get(node_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._state_locks[node_id] = lock
+        return lock
 
     async def init(self) -> None:
         """Bring up the iroh node, load monitor targets, and start the scheduler."""
@@ -923,6 +931,9 @@ class MonitorEngine:
             return LatencyRecord(timestamp=now, rtt_ms=None, status=peer.current_status)
 
         conn = None
+        fail_reason: str | None = None
+        fail_type: str | None = None
+        fail_msg: str | None = None
 
         try:
             logger.debug("[probe] {} connecting (timeout={}s)", label, PROBE_TIMEOUT_SECONDS)
@@ -944,14 +955,6 @@ class MonitorEngine:
             record = LatencyRecord(
                 timestamp=now, rtt_ms=rtt_ms, status=PeerStatus.ALIVE
             )
-            peer.last_seen = now
-            peer.consecutive_failures = 0
-            peer.consecutive_successes += 1
-            peer.last_fail_reason = None
-            logger.debug(
-                "[probe] {} ok  rtt={:.2f}ms  successes={}",
-                label, rtt_ms or 0, peer.consecutive_successes,
-            )
 
             # Query connection type with a short timeout to prevent cycle hangs.
             try:
@@ -966,18 +969,9 @@ class MonitorEngine:
             record = LatencyRecord(
                 timestamp=now, rtt_ms=None, status=PeerStatus.DEAD
             )
-            peer.consecutive_failures += 1
-            peer.consecutive_successes = 0
-            msg = exc.message() if hasattr(exc, "message") else str(exc)
-            peer.last_fail_reason = f"{type(exc).__name__}: {msg}"[:200]
-            logger.warning(
-                "[probe] {} fail  failures={}/{}  reason={}: {}",
-                label,
-                peer.consecutive_failures,
-                self._down_after,
-                type(exc).__name__,
-                msg,
-            )
+            fail_type = type(exc).__name__
+            fail_msg = exc.message() if hasattr(exc, "message") else str(exc)
+            fail_reason = f"{fail_type}: {fail_msg}"[:200]
 
         finally:
             if conn is not None:
@@ -986,15 +980,31 @@ class MonitorEngine:
                 except Exception:  # noqa: BLE001 S110
                     pass  # best-effort conn cleanup
 
-        peer.latency_history.append(record)
-        try:
-            self._history.record(
-                peer.entry.node_id, record.timestamp, record.rtt_ms, record.status
-            )
-        except Exception as exc:
-            logger.warning("[probe] {} history write failed: {}", label, exc)
+        async with self._state_lock_for(peer.entry.node_id):
+            if record.status == PeerStatus.ALIVE:
+                peer.last_seen = now
+                peer.consecutive_failures = 0
+                peer.consecutive_successes += 1
+                peer.last_fail_reason = None
+                logger.debug(
+                    "[probe] {} ok  rtt={:.2f}ms  successes={}",
+                    label, record.rtt_ms or 0, peer.consecutive_successes,
+                )
+            else:
+                peer.consecutive_failures += 1
+                peer.consecutive_successes = 0
+                peer.last_fail_reason = fail_reason
+                logger.warning(
+                    "[probe] {} fail  failures={}/{}  reason={}: {}",
+                    label,
+                    peer.consecutive_failures,
+                    self._down_after,
+                    fail_type or "Error",
+                    fail_msg or "",
+                )
+            peer.latency_history.append(record)
+            await self._maybe_transition(peer, record, now)
 
-        await self._maybe_transition(peer, record, now)
         return record
 
     async def _maybe_transition(
@@ -1012,8 +1022,9 @@ class MonitorEngine:
             elif prev != PeerStatus.ALIVE and peer.consecutive_successes >= self._up_after:
                 new_state = PeerStatus.ALIVE
         else:
-            # ALIVE / UNKNOWN → DEAD requires ``down_after`` failures.
-            if prev != PeerStatus.DEAD and peer.consecutive_failures >= self._down_after:
+            # Only a known-live peer transitions DOWN. First observations that
+            # fail remain UNKNOWN until a successful liveness signal arrives.
+            if prev == PeerStatus.ALIVE and peer.consecutive_failures >= self._down_after:
                 new_state = PeerStatus.DEAD
 
         if new_state is None or new_state == prev:
@@ -1398,43 +1409,44 @@ class MonitorEngine:
         direction the connection was initiated in doesn't change what it means:
         a push is authenticated liveness evidence.
         """
-        state = self._devices.get(remote_node_id)
-        if state is None:
-            logger.debug(
-                "[push] recording transient state for {} (not in dashboard)",
-                remote_node_id[:12],
-            )
-            trusted = self._trust.get_peer(remote_node_id)
-            entry = PeerEntry(
-                node_id=remote_node_id,
-                alias=trusted.alias if trusted else None,
-            )
-            state = PeerState(entry)
-            # Don't insert into self._devices: if the peer hasn't been granted
-            # monitor (verify_and_authorize already gated this, so they have),
-            # they'd appear in self._devices via _load_devices. If they're not
-            # there, a live reload missed them — just record history + exit.
+        async with self._state_lock_for(remote_node_id):
+            state = self._devices.get(remote_node_id)
+            if state is None:
+                logger.debug(
+                    "[push] recording transient state for {} (not in dashboard)",
+                    remote_node_id[:12],
+                )
+                trusted = self._trust.get_peer(remote_node_id)
+                entry = PeerEntry(
+                    node_id=remote_node_id,
+                    alias=trusted.alias if trusted else None,
+                )
+                state = PeerState(entry)
+                # Don't insert into self._devices: if the peer hasn't been granted
+                # monitor (verify_and_authorize already gated this, so they have),
+                # they'd appear in self._devices via _load_devices. If they're not
+                # there, a live reload missed them — just record history + exit.
 
-        now = datetime.now(IST)
-        state.last_seen = now
-        state.consecutive_failures = 0
-        state.consecutive_successes += 1
-        state.last_fail_reason = None
-        record = LatencyRecord(timestamp=now, rtt_ms=None, status=PeerStatus.ALIVE)
-        state.latency_history.append(record)
-        try:
-            self._history.record(
-                remote_node_id, now, None, PeerStatus.ALIVE
+            now = datetime.now(IST)
+            state.last_seen = now
+            state.consecutive_failures = 0
+            state.consecutive_successes += 1
+            state.last_fail_reason = None
+            record = LatencyRecord(timestamp=now, rtt_ms=None, status=PeerStatus.ALIVE)
+            state.latency_history.append(record)
+            try:
+                self._history.record(
+                    remote_node_id, now, None, PeerStatus.ALIVE
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[push] history write failed for {}: {}", remote_node_id[:12], exc
+                )
+            logger.info(
+                "[push] received from {}  successes={}",
+                remote_node_id[:12], state.consecutive_successes,
             )
-        except Exception as exc:
-            logger.warning(
-                "[push] history write failed for {}: {}", remote_node_id[:12], exc
-            )
-        logger.info(
-            "[push] received from {}  successes={}",
-            remote_node_id[:12], state.consecutive_successes,
-        )
-        await self._maybe_transition(state, record, now)
+            await self._maybe_transition(state, record, now)
 
     async def _run_push_cycle(self) -> None:
         """Push a heartbeat to each ``--push-to`` target."""
@@ -1635,13 +1647,25 @@ class MonitorEngine:
             logger.debug("[cycle] no monitor targets -- skipping")
             return
 
-        device_labels = [p.entry.alias or p.entry.node_id[:12] for p in self._devices.values()]
-        logger.debug("[cycle] probing {} targets: {}", len(self._devices), device_labels)
+        peers = list(self._devices.values())
+        device_labels = [p.entry.alias or p.entry.node_id[:12] for p in peers]
+        logger.debug("[cycle] probing {} targets: {}", len(peers), device_labels)
 
         results = await asyncio.gather(
-            *(self._probe_peer(p) for p in self._devices.values()),
+            *(self._probe_peer(p) for p in peers),
             return_exceptions=True,
         )
+
+        history_rows = [
+            (peer.entry.node_id, r.timestamp, r.rtt_ms, r.status)
+            for peer, r in zip(peers, results)
+            if isinstance(r, LatencyRecord)
+        ]
+        if history_rows:
+            try:
+                await asyncio.to_thread(self._history.record_many, history_rows)
+            except Exception as exc:
+                logger.warning("[cycle] history batch write failed: {}", exc)
 
         alive = sum(
             1
@@ -1661,7 +1685,7 @@ class MonitorEngine:
         logger.info(
             "Heartbeat  alive={}/{}  dead={}  errors={}",
             alive,
-            len(self._devices),
+            len(peers),
             dead,
             errors,
         )

@@ -172,6 +172,7 @@ class LogStore:
         # CREATE INDEX statements in _SCHEMA reference that column.
         self._migrate_peer_node_id_column()
         self._conn.executescript(_SCHEMA)
+        self._migrate_event_dedupe()
         logger.info("[logstore] opened {}", self._path)
 
     def _has_column(self, table: str, column: str) -> bool:
@@ -254,6 +255,26 @@ class LogStore:
                 self._conn.execute(stmt)
         logger.info("[logstore] migrated schema (added peer_node_id column)")
 
+    def _migrate_event_dedupe(self) -> None:
+        """Deduplicate legacy events before installing the unique index."""
+        with self._lock:
+            self._conn.execute(
+                """
+                DELETE FROM events
+                WHERE id NOT IN (
+                    SELECT MIN(id)
+                    FROM events
+                    GROUP BY peer_node_id, ts, event, COALESCE(detail, '')
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedupe
+                ON events(peer_node_id, ts, event, COALESCE(detail, ''))
+                """
+            )
+
     def close(self) -> None:
         with self._lock:
             try:
@@ -270,7 +291,7 @@ class LogStore:
         payload = json.dumps(detail) if detail else None
         with self._lock:
             self._conn.execute(
-                "INSERT INTO events (peer_node_id, ts, event, detail) VALUES (?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO events (peer_node_id, ts, event, detail) VALUES (?, ?, ?, ?)",
                 (self._own_node_id or "self", ts, event, payload),
             )
         logger.debug("[logstore] event: {} {}", event, detail or "")
@@ -355,9 +376,17 @@ class LogStore:
         cutoff = _to_epoch(now)
         with self._lock:
             cur = self._conn.execute(
+                "SELECT MAX(window_end) FROM stat_buckets "
+                "WHERE peer_node_id = ? AND bucket_size = ?",
+                (own, BUCKET_5MIN_SECS),
+            )
+            row = cur.fetchone()
+            latest_window_end = row[0] if row and row[0] is not None else None
+            lower_bound = latest_window_end if latest_window_end is not None else 0
+            cur = self._conn.execute(
                 "SELECT ts, payload FROM raw_snapshots "
-                "WHERE peer_node_id = ? AND ts <= ? ORDER BY ts ASC",
-                (own, cutoff),
+                "WHERE peer_node_id = ? AND ts >= ? AND ts <= ? ORDER BY ts ASC",
+                (own, lower_bound, cutoff),
             )
             rows = cur.fetchall()
 
@@ -498,6 +527,24 @@ class LogStore:
             date_key = dt.strftime("%Y-%m-%d")
             day_buckets.setdefault(date_key, []).append((cpu_avg, mem_avg, samples))
 
+        incident_counts: dict[str, int] = {}
+        for date_key in day_buckets:
+            try:
+                day_dt = datetime.strptime(date_key, "%Y-%m-%d").replace(tzinfo=IST)
+                day_end = day_dt + timedelta(days=1)
+                inc_events = self.get_events(
+                    since_ts=day_dt,
+                    until_ts=day_end,
+                    peer_node_id=own,
+                )
+                incident_counts[date_key] = sum(
+                    1
+                    for e in inc_events
+                    if e.event in (EV_CONTAINER_EXITED, EV_CONTAINER_UNHEALTHY)
+                )
+            except Exception:
+                incident_counts[date_key] = 0
+
         created = 0
         with self._lock:
             self._conn.execute("BEGIN")
@@ -505,17 +552,7 @@ class LogStore:
                 for date_key, buckets in day_buckets.items():
                     cpus = [b[0] for b in buckets if b[0] is not None]
                     mems = [b[1] for b in buckets if b[1] is not None]
-
-                    try:
-                        day_dt = datetime.strptime(date_key, "%Y-%m-%d").replace(tzinfo=IST)
-                        day_end = day_dt + timedelta(days=1)
-                        inc_events = self.get_events(since_ts=day_dt, until_ts=day_end)
-                        incidents = sum(
-                            1 for e in inc_events
-                            if e.event in (EV_CONTAINER_EXITED, EV_CONTAINER_UNHEALTHY)
-                        )
-                    except Exception:
-                        incidents = 0
+                    incidents = incident_counts.get(date_key, 0)
 
                     cur = self._conn.execute(
                         """INSERT OR IGNORE INTO daily_summaries
@@ -784,7 +821,7 @@ class LogStore:
                     continue
                 detail = ev.get("detail")
                 cur = self._conn.execute(
-                    "INSERT INTO events (peer_node_id, ts, event, detail) VALUES (?, ?, ?, ?)",
+                    "INSERT OR IGNORE INTO events (peer_node_id, ts, event, detail) VALUES (?, ?, ?, ?)",
                     (
                         peer_node_id,
                         int(ts_epoch),
