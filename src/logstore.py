@@ -47,7 +47,7 @@ EV_SYSTEM_HIGH_CPU = "system_high_cpu"
 EV_SYSTEM_HIGH_MEM = "system_high_mem"
 EV_DISK_NEAR_FULL = "disk_near_full"
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -172,6 +172,7 @@ class LogStore:
         # CREATE INDEX statements in _SCHEMA reference that column.
         self._migrate_peer_node_id_column()
         self._conn.executescript(_SCHEMA)
+        self._migrate_event_timestamps()
         self._migrate_event_dedupe()
         logger.info("[logstore] opened {}", self._path)
 
@@ -275,6 +276,28 @@ class LogStore:
                 """
             )
 
+    def _migrate_event_timestamps(self) -> None:
+        """Convert legacy second-precision event timestamps to milliseconds.
+
+        Detects old-format timestamps (ts < 1e11) and multiplies them to
+        match the new ms-precision convention.  Idempotent — a second
+        run is a no-op.
+        """
+        if not self._table_exists("events"):
+            return
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT COUNT(*) FROM events WHERE ts > 0 AND ts < 100000000000"
+            )
+            stale = cur.fetchone()[0]
+            if stale > 0:
+                self._conn.execute(
+                    "UPDATE events SET ts = ts * 1000 WHERE ts > 0 AND ts < 100000000000"
+                )
+                logger.info(
+                    "[logstore] migrated {} event timestamps to ms precision", stale
+                )
+
     def close(self) -> None:
         with self._lock:
             try:
@@ -287,7 +310,7 @@ class LogStore:
     # ------------------------------------------------------------------
 
     def record_event(self, event: str, detail: Optional[dict] = None) -> None:
-        ts = _to_epoch(datetime.now(IST))
+        ts = int(datetime.now(IST).timestamp() * 1000)
         payload = json.dumps(detail) if detail else None
         with self._lock:
             self._conn.execute(
@@ -303,8 +326,8 @@ class LogStore:
         limit: int = 1000,
         peer_node_id: Optional[str] = None,
     ) -> list[EventRow]:
-        since = _to_epoch(since_ts) if since_ts else 0
-        until = _to_epoch(until_ts) if until_ts else 9_999_999_999
+        since = int(_to_epoch(since_ts) * 1000) if since_ts else 0
+        until = int(_to_epoch(until_ts) * 1000) if until_ts else 9_999_999_999_999
         nid = peer_node_id if peer_node_id is not None else (self._own_node_id or "self")
         with self._lock:
             cur = self._conn.execute(
@@ -316,7 +339,7 @@ class LogStore:
         return [
             EventRow(
                 id=r[0],
-                ts=_from_epoch(r[1]),
+                ts=datetime.fromtimestamp(r[1] / 1000.0, tz=IST),
                 event=r[2],
                 detail=json.loads(r[3]) if r[3] else None,
             )
@@ -373,7 +396,8 @@ class LogStore:
         """
         now = datetime.now(IST)
         own = self._own_node_id or "self"
-        cutoff = _to_epoch(now)
+        now_epoch = _to_epoch(now)
+        cutoff = now_epoch - (now_epoch % BUCKET_5MIN_SECS)
         with self._lock:
             cur = self._conn.execute(
                 "SELECT MAX(window_end) FROM stat_buckets "
@@ -385,7 +409,7 @@ class LogStore:
             lower_bound = latest_window_end if latest_window_end is not None else 0
             cur = self._conn.execute(
                 "SELECT ts, payload FROM raw_snapshots "
-                "WHERE peer_node_id = ? AND ts >= ? AND ts <= ? ORDER BY ts ASC",
+                "WHERE peer_node_id = ? AND ts >= ? AND ts < ? ORDER BY ts ASC",
                 (own, lower_bound, cutoff),
             )
             rows = cur.fetchall()
@@ -754,12 +778,30 @@ class LogStore:
                     SELECT MAX(ts) AS ts FROM raw_snapshots WHERE peer_node_id = ?
                     UNION ALL
                     SELECT MAX(ts) AS ts FROM events        WHERE peer_node_id = ?
+                    UNION ALL
+                    SELECT MAX(window_end) AS ts FROM stat_buckets
+                        WHERE peer_node_id = ?
                 )
                 """,
-                (peer_node_id, peer_node_id),
+                (peer_node_id, peer_node_id, peer_node_id),
             )
             row = cur.fetchone()
-        return _from_epoch(row[0]) if row and row[0] is not None else None
+            max_epoch = row[0] if row and row[0] is not None else None
+
+            cur = self._conn.execute(
+                "SELECT MAX(date) FROM daily_summaries WHERE peer_node_id = ?",
+                (peer_node_id,),
+            )
+            date_row = cur.fetchone()
+            if date_row and date_row[0] is not None:
+                try:
+                    dt = datetime.strptime(date_row[0], "%Y-%m-%d").replace(tzinfo=IST)
+                    date_epoch = _to_epoch(dt)
+                    max_epoch = max(max_epoch or 0, date_epoch)
+                except ValueError:
+                    pass
+
+        return _from_epoch(max_epoch) if max_epoch is not None else None
 
     def snapshots_for_peer(
         self,
@@ -779,10 +821,11 @@ class LogStore:
     def merge_sync_payload(self, peer_node_id: str, payload: dict) -> dict:
         """Idempotently insert a peer's sync payload into local tables.
 
-        Returns ``{snapshots_merged, events_merged, strategy}``.
+        Returns ``{snapshots_merged, events_merged, buckets_merged, strategy}``.
         """
         snaps = payload.get("raw_snapshots") or []
         events = payload.get("events") or []
+        buckets = payload.get("buckets") or []
         strategy = payload.get("sync_strategy") or "unknown"
 
         snapshots_merged = 0
@@ -812,11 +855,13 @@ class LogStore:
                 if ts_raw is None:
                     continue
                 try:
-                    ts_epoch = (
-                        ts_raw
-                        if isinstance(ts_raw, (int, float))
-                        else _to_epoch(datetime.fromisoformat(ts_raw))
-                    )
+                    if isinstance(ts_raw, (int, float)):
+                        ts_epoch = ts_raw
+                    else:
+                        dt = datetime.fromisoformat(ts_raw)
+                        ts_epoch = int(dt.timestamp() * 1000)
+                    if ts_epoch < 100000000000:
+                        ts_epoch = int(ts_epoch * 1000)
                 except (ValueError, TypeError):
                     continue
                 detail = ev.get("detail")
@@ -831,9 +876,66 @@ class LogStore:
                 )
                 if cur.rowcount:
                     events_merged += 1
+
+            buckets_merged = 0
+            for b in buckets:
+                if "window_start" in b:
+                    # StatBucket-style entry
+                    ws = b.get("window_start")
+                    we = b.get("window_end")
+                    if ws is None or we is None:
+                        continue
+                    try:
+                        ws_epoch = (
+                            ws if isinstance(ws, (int, float))
+                            else _to_epoch(datetime.fromisoformat(ws))
+                        )
+                        we_epoch = (
+                            we if isinstance(we, (int, float))
+                            else _to_epoch(datetime.fromisoformat(we))
+                        )
+                    except (ValueError, TypeError):
+                        continue
+                    cur = self._conn.execute(
+                        """INSERT OR IGNORE INTO stat_buckets
+                        (peer_node_id, window_start, window_end, bucket_size,
+                         cpu_avg, cpu_max, mem_avg, mem_max,
+                         disk_pct_avg, net_rx_delta, net_tx_delta, samples)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            peer_node_id,
+                            int(ws_epoch), int(we_epoch),
+                            b.get("bucket_size", 0),
+                            b.get("cpu_avg"), b.get("cpu_max"),
+                            b.get("mem_avg"), b.get("mem_max"),
+                            b.get("disk_pct_avg"),
+                            b.get("net_rx_delta"), b.get("net_tx_delta"),
+                            b.get("samples", 0),
+                        ),
+                    )
+                    if cur.rowcount:
+                        buckets_merged += 1
+                elif "date" in b:
+                    # Daily-summary-style entry
+                    cur = self._conn.execute(
+                        """INSERT OR REPLACE INTO daily_summaries
+                        (peer_node_id, date, uptime_pct, avg_cpu, avg_mem, incidents)
+                        VALUES (?,?,?,?,?,?)""",
+                        (
+                            peer_node_id,
+                            str(b.get("date", "")),
+                            b.get("uptime_pct"),
+                            b.get("avg_cpu"),
+                            b.get("avg_mem"),
+                            b.get("incidents", 0),
+                        ),
+                    )
+                    if cur.rowcount:
+                        buckets_merged += 1
         return {
             "snapshots_merged": snapshots_merged,
             "events_merged": events_merged,
+            "buckets_merged": buckets_merged,
             "strategy": strategy,
         }
 

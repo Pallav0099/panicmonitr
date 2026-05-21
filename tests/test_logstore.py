@@ -70,11 +70,11 @@ class LogStoreTests(unittest.TestCase):
 
                 self.assertEqual(
                     store.merge_sync_payload("peer-a", payload),
-                    {"snapshots_merged": 1, "events_merged": 1, "strategy": "raw"},
+                    {"snapshots_merged": 1, "events_merged": 1, "buckets_merged": 0, "strategy": "raw"},
                 )
                 self.assertEqual(
                     store.merge_sync_payload("peer-a", payload),
-                    {"snapshots_merged": 0, "events_merged": 0, "strategy": "raw"},
+                    {"snapshots_merged": 0, "events_merged": 0, "buckets_merged": 0, "strategy": "raw"},
                 )
             finally:
                 store.close()

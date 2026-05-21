@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import signal
 import struct
 from datetime import datetime
@@ -47,6 +48,11 @@ PUSH_ALPN = b"panic-monitor/push/0"
 STATS_GOSSIP_ALPN = b"panic-monitor/stats-gossip/0"
 SYNC_ALPN = b"panic-monitor/sync/0"
 LOGS_ALPN = b"panic-monitor/logs/0"
+
+_CONTAINER_REF_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+# Maximum log bytes the server will return per container-logs request.
+_MAX_LOG_BYTES = 2_000_000  # 2 MiB
 PROBE_TIMEOUT_SECONDS = 10
 # `--fetch-dashboard` spins up a fresh iroh node, so cold-start discovery
 # needs more slack than an already-warm daemon probe.
@@ -325,7 +331,16 @@ class ContainerLogsProtocol:
             req_bytes = await asyncio.wait_for(_read_framed(recv_stream, 1024), timeout=10)
             req = json.loads(req_bytes.decode("utf-8"))
             cid = req.get("cid")
-            tail = int(req.get("tail", 20))
+            if not cid or not isinstance(cid, str) or not _CONTAINER_REF_RE.match(cid):
+                payload = json.dumps({"error": "invalid container id"}).encode("utf-8")
+                await _write_framed(send_stream, payload)
+                await send_stream.finish()
+                return
+            try:
+                tail = int(req.get("tail", 20))
+            except (TypeError, ValueError):
+                tail = 20
+            tail = max(1, min(tail, 200))
 
             sc = engine._stats_collector
             client = sc._docker_client if sc is not None else None
@@ -339,6 +354,8 @@ class ContainerLogsProtocol:
                 c = client.containers.get(cid)
                 raw = c.logs(tail=tail, timestamps=True, stdout=True, stderr=True)
                 logs = (raw or b"").decode("utf-8", errors="replace")
+                if len(logs) > _MAX_LOG_BYTES:
+                    logs = logs[-_MAX_LOG_BYTES:]
                 payload = json.dumps({"logs": logs}).encode("utf-8")
             except Exception as exc:
                 payload = json.dumps({"error": str(exc)}).encode("utf-8")
@@ -902,10 +919,11 @@ class MonitorEngine:
     # Heartbeat
     # ------------------------------------------------------------------
 
-    async def _probe_peer(self, peer: PeerState) -> LatencyRecord:
+    async def _probe_peer(self, peer: PeerState) -> Optional[LatencyRecord]:
         """Attempt a single liveness probe. No cert exchange.
 
-        The probe's raw result goes into history unconditionally. The
+        The probe's raw result goes into history unconditionally. Maintenance-
+        skipped probes return ``None`` and are not recorded. The
         externally-visible ``peer.current_status`` only transitions once the
         threshold (``down_after`` / ``up_after``) is crossed, which is what
         drives log events + webhook notifications.
@@ -928,7 +946,7 @@ class MonitorEngine:
                 "[probe] {} skipped (maintenance until {})",
                 label, trusted.maintenance_end,
             )
-            return LatencyRecord(timestamp=now, rtt_ms=None, status=peer.current_status)
+            return None
 
         conn = None
         fail_reason: str | None = None
