@@ -208,6 +208,8 @@ class StatusProtocol:
         logger.debug("[status.accept] incoming from {}", remote[:12])
         ok, reason = self._trust.verify_and_authorize(remote, "view_dashboard")
         if not ok:
+            ok, reason = self._trust.verify_and_authorize(remote, "monitor")
+        if not ok:
             logger.warning("[status.accept] rejected from {}: {}", remote[:12], reason)
             conn.close(403, reason.encode()[:120])
             return
@@ -308,6 +310,8 @@ class ContainerLogsProtocol:
         remote = conn.remote_node_id()
         logger.debug("[logs.accept] incoming from {}", remote[:12])
         ok, reason = self._trust.verify_and_authorize(remote, "view_dashboard")
+        if not ok:
+            ok, reason = self._trust.verify_and_authorize(remote, "monitor")
         if not ok:
             logger.warning("[logs.accept] rejected from {}: {}", remote[:12], reason)
             conn.close(403, reason.encode()[:120])
@@ -1256,14 +1260,15 @@ class MonitorEngine:
     async def _run_peer_dashboard_pull(self) -> None:
         """Pull each peer's dashboard snapshot over STATUS_ALPN and merge.
 
-        Only targets peers from whom we hold ``view_dashboard``. The snapshot
-        carries ``own_stats`` + ``own_stats_history`` which we merge into
-        ``PeerState.last_stats`` / ``stats_history`` for the live UI, and
-        into ``LogStore`` keyed by the peer's node_id for history queries.
+        Prefers peers with explicit ``view_dashboard`` permission; falls
+        back to ``monitor`` so that the default peer-add permissions
+        (monitor-only) also enable live stats sharing without extra config.
         """
         if self._iroh is None:
             return
         peers = self._trust.peers_with_permission("view_dashboard")
+        if not peers:
+            peers = self._trust.peers_with_permission("monitor")
         if not peers:
             return
         tasks = [self._pull_one_peer_dashboard(p.node_id) for p in peers]

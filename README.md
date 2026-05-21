@@ -28,8 +28,41 @@ What you get out of the box:
 
 ---
 
+## Quick start
+
+Run these on **both** machines.
+
+```fish
+# 1. Install
+git clone <repo-url> panic-monitr && cd panic-monitr
+python3 -m venv .venv && source .venv/bin/activate.fish   # or .venv/bin/activate
+pip install -e .
+
+# 2. Init + start the daemon
+panic-monitor --init              # pick a password, generates signing identity
+panic-monitor --install-service   # wires up systemd, encrypts password, starts
+
+# 3. Share your Node ID with the other machine
+panic-monitor --show-identity     # prints a 64-char hex string — share it
+
+# 4. Add the other machine's Node ID
+panic-monitor --add-peer <THEIR_NODE_ID> --alias "my-other-machine" --permissions monitor
+
+# 5. Open the dashboard
+open http://127.0.0.1:42069/     # live dashboard, auto-refreshing
+```
+
+After both sides add each other, you'll see the peer show up in the fleet
+panel within one probe interval (30s default). Click any peer card to see
+their live CPU, memory, disk, processes, and containers.
+
+That's it. Read on for roles, webhooks, hardening, and troubleshooting.
+
+---
+
 ## Contents
 
+- [Quick start](#quick-start)
 - [Prerequisites](#prerequisites)
 - [Install](#install)
 - [First-time setup](#first-time-setup)
@@ -157,19 +190,24 @@ key (Signal, paste, QR — doesn't matter, it's not secret).
 ```fish
 panic-monitor --add-peer <NODE_ID> \
     --alias "api-server" \
-    --permissions "monitor,view_dashboard" \
+    --permissions monitor \
     --tags "prod,critical"
 ```
+
+The default `monitor` permission covers everything — heartbeat probes,
+dashboard stats pull, container log fetch, and historical sync. You
+don't need separate `view_dashboard` unless you want a peer to see your
+stats without being probed.
 
 The change takes effect immediately — the daemon reloads its monitor target
 list via the control socket. No restart.
 
 ### Step 3 — they add you on their side
 
-Trust is per-direction. For your node to be able to *pull* their dashboard,
-they must also `--add-peer` your Node ID with the `view_dashboard` permission.
-For them to push heartbeats to you, they need `monitor` on your side and you
-need to be listed as a `--push-to` target on theirs.
+Trust is per-direction. For your node to be able to *pull* their dashboard
+or probe them, they must also `--add-peer` your Node ID. With default
+`monitor` permission on both sides, full bidirectional monitoring and stats
+sharing work out of the box.
 
 ### Listing, filtering, revoking
 
@@ -206,21 +244,30 @@ Each peer can hold any subset of these:
 
 | Permission | What it grants the peer |
 |---|---|
-| `monitor` | They can be the *subject* of your heartbeat probes (you ping them, you record their uptime) |
-| `view_dashboard` | They can pull your live dashboard snapshot — own CPU/mem/disk/container stats, recent transitions, peer list |
+| `monitor` | **Everything** — probing, dashboard stats, container logs, push, and
+historical sync. This is the default and the only permission most setups need. |
+| `view_dashboard` | Optional. Explicit dashboard + container-logs access,
+without requiring `monitor`. Useful when you want a peer to see your stats
+but not appear on your probe target list. Ignored when `monitor` is also
+present (already covered). |
 | `chat` | Reserved — currently a no-op slot for future protocols |
 | `split` / `call` / `drop` | Same — protocol slots reserved for the wider PanicLab ecosystem |
 | `*` | All current and future permissions |
 
-The set is enforced inside the iroh ALPN handlers. A peer with only `monitor`
-can be probed but cannot pull your dashboard; a peer with only `view_dashboard`
-can fetch stats but won't appear on your monitor target list.
+**Permission fallback.** All ALPN handlers that need `view_dashboard` also
+accept `monitor` as a fallback. This means adding a peer with the default
+`["monitor"]` is enough for the full feature set — live stats sharing,
+container log fetching, and heartbeat probes all work without explicitly
+adding `view_dashboard`.
 
 ```fish
-# grant only dashboard access — you can see them, they can't be probed by you
+# The default — covers everything (probe + stats + logs + sync)
+panic-monitor --add-peer <NID> --permissions monitor
+
+# Explicit dashboard-only access (won't appear on your probe target list)
 panic-monitor --add-peer <NID> --permissions view_dashboard
 
-# upgrade an existing peer
+# Upgrade an existing peer
 panic-monitor --update-permissions <NID> "monitor,view_dashboard"
 ```
 
@@ -593,6 +640,25 @@ The daemon isn't actually running, or the webapp failed to bind. Check both:
 systemctl --user is-active panic-monitor.service
 journalctl --user -u panic-monitor.service | grep webapp
 ```
+
+### Peer shows alive but clicking shows no system stats
+
+Both sides are running but the dashboard shows only the peer's liveness
+status with no CPU/mem/disk/container data. This is almost always a
+permissions gap — the remote peer hasn't granted you `view_dashboard` or
+`monitor` on their trust log.
+
+**Fix:** On every peer that should share stats, ensure the other node has
+at least `monitor` permission (or `view_dashboard`). Restarting the
+daemon is not required — the control-socket reload picks up new
+permissions immediately:
+
+```fish
+panic-monitor --add-peer <OTHER_NODE_ID> --permissions monitor --force
+```
+
+After both sides have each other with `monitor`, stats should appear
+within one `--stats-interval` (default 10 seconds).
 
 ### `daemon error: Invalid Node ID`
 
