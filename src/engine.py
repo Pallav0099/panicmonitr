@@ -45,7 +45,6 @@ from src.trust import PeerTrustManager
 HEARTBEAT_ALPN = b"panic-monitor/heartbeat/1"
 STATUS_ALPN = b"panic-monitor/status/0"
 PUSH_ALPN = b"panic-monitor/push/0"
-STATS_GOSSIP_ALPN = b"panic-monitor/stats-gossip/0"
 SYNC_ALPN = b"panic-monitor/sync/0"
 LOGS_ALPN = b"panic-monitor/logs/0"
 
@@ -579,7 +578,7 @@ class MonitorEngine:
 
     Now also:
       • Collects own system stats (when role includes ``monitored``)
-      • Broadcasts stat snapshots via iroh-gossip
+      • Serves stats to peers via STATUS_ALPN (pull-based)
       • Maintains a server-side LogStore for offline sync
     """
 
@@ -631,7 +630,6 @@ class MonitorEngine:
         self._logstore: Optional[LogStore] = None
         self._logstore_path = logstore_path
         self._include_docker = include_docker
-        self._gossip_topic: Optional[bytes] = None  # set in init()
 
         self._iroh: iroh.Iroh | None = None
         self._scheduler: AsyncIOScheduler | None = None
@@ -775,7 +773,7 @@ class MonitorEngine:
                 name="Peer dashboard pull",
             )
 
-        # Stats collection + gossip broadcast (monitored role)
+        # Stats collection (monitored role)
         if is_monitored and self._stats_collector is not None:
             self._scheduler.add_job(
                 self._run_stats_cycle,
@@ -1152,11 +1150,11 @@ class MonitorEngine:
             logger.debug("[gc] pruned {} stale alert-fired entries", len(stale))
 
     # ------------------------------------------------------------------
-    # Stats collection + gossip broadcast (Phase 1/2/3)
+    # Stats collection (Phase 1/2/3)
     # ------------------------------------------------------------------
 
     async def _run_stats_cycle(self) -> None:
-        """Collect system stats, record to logstore, broadcast via gossip."""
+        """Collect system stats, record to logstore."""
         if self._stats_collector is None or self._logstore is None:
             return
         try:
@@ -1171,8 +1169,11 @@ class MonitorEngine:
             # Store snapshot in logstore (raw ring buffer)
             await asyncio.to_thread(self._logstore.record_snapshot, snap)
 
-            # Broadcast lightweight gossip message (just the snapshot)
-            await self._broadcast_stats(snap)
+            logger.debug(
+                "[stats_cycle] snapshot recorded  cpu={}%  mem={}%  containers={}",
+                snap.get("cpu_percent"), snap.get("mem_percent"),
+                len(snap.get("containers", [])),
+            )
 
         except Exception as exc:
             logger.error("[stats_cycle] failed: {}", exc)
@@ -1232,43 +1233,24 @@ class MonitorEngine:
                 c.get("name", ""): c for c in new_containers if c.get("name")
             }
 
-    async def _broadcast_stats(self, snap: dict) -> None:
-        """Broadcast a stats snapshot message via iroh-gossip.
-
-        The topic is derived from our node_id. Monitoring peers subscribe to
-        their monitored peers' topics to receive live stats.
-        Currently sends as a framed JSON direct-connection message since
-        iroh-gossip API is version-dependent. Gossip topology is evolving.
-        """
-        if self._iroh is None:
-            return
-        try:
-            msg = json.dumps({
-                "type": "stats_snapshot",
-                "node_id": self._node_id_str,
-                "data": snap,
-            }).encode("utf-8")
-            # Gossip broadcast: when iroh-gossip is stable we'll use the
-            # proper gossip API. For now, peers requesting stats subscribe
-            # via a direct connection with the STATUS_ALPN + a gossip flag.
-            # TODO: wire up iroh.Gossip.subscribe/broadcast when API stabilizes
-            logger.debug("[stats] snapshot collected cpu={}% mem={}%",
-                        snap.get("cpu_percent"), snap.get("mem_percent"))
-        except Exception as exc:
-            logger.debug("[stats] broadcast skipped: {}", exc)
-
     async def _run_peer_dashboard_pull(self) -> None:
         """Pull each peer's dashboard snapshot over STATUS_ALPN and merge.
 
-        Prefers peers with explicit ``view_dashboard`` permission; falls
-        back to ``monitor`` so that the default peer-add permissions
-        (monitor-only) also enable live stats sharing without extra config.
+        Pulls from all peers with ``view_dashboard`` or ``monitor`` permission.
+        The remote side checks whether we hold the right permission; locally
+        we simply attempt every peer that could plausibly accept.
         """
         if self._iroh is None:
             return
-        peers = self._trust.peers_with_permission("view_dashboard")
-        if not peers:
-            peers = self._trust.peers_with_permission("monitor")
+        seen: set[str] = set()
+        peers = []
+        for p in (
+            self._trust.peers_with_permission("view_dashboard")
+            + self._trust.peers_with_permission("monitor")
+        ):
+            if p.node_id not in seen:
+                seen.add(p.node_id)
+                peers.append(p)
         if not peers:
             return
         tasks = [self._pull_one_peer_dashboard(p.node_id) for p in peers]
@@ -1285,7 +1267,11 @@ class MonitorEngine:
         try:
             snap = await self.fetch_peer_dashboard(node_id)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("[stats-pull] {} skipped: {}", node_id[:12], exc)
+            msg = exc.message() if hasattr(exc, "message") else str(exc)
+            logger.info(
+                "[stats-pull] {} failed: {}: {}",
+                node_id[:12], type(exc).__name__, msg,
+            )
             return
 
         own_stats = snap.get("own_stats")
@@ -1298,6 +1284,14 @@ class MonitorEngine:
                 state.stats_history.append(own_stats)
             if state.has_dashboard_gap:
                 state.has_dashboard_gap = False
+
+        if own_stats is not None:
+            cpu = own_stats.get("cpu_percent")
+            mem = own_stats.get("mem_percent")
+            logger.info(
+                "[stats-pull] {} ok  cpu={}%  mem={}%",
+                node_id[:12], cpu, mem,
+            )
 
         if self._logstore is None or own_stats is None:
             return

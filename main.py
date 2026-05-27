@@ -149,6 +149,8 @@ def parse_args() -> argparse.Namespace:
                         help="Port for Flask+Plotly web dashboard (default: 42069; 0 to disable)")
     parser.add_argument("--stats-interval", type=int, default=10,
                         help="System stats collection interval in seconds (default: 10)")
+    parser.add_argument("--no-docker", action="store_true",
+                        help="Disable Docker container stats collection")
     parser.add_argument("--logstore-db", type=Path, default=paths.default_logstore_path(),
                         help="Path to the server-side logstore SQLite DB (default: <data_dir>/logstore.db)")
     parser.add_argument("--password-from", type=str, default=None,
@@ -887,6 +889,7 @@ def cli_main() -> None:
         stats_interval_seconds=args.stats_interval,
         logstore_path=args.logstore_db,
         dashboard_port=args.dashboard_port,
+        include_docker=not args.no_docker,
     )
 
     if args.fetch_dashboard:

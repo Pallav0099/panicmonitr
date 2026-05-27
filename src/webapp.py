@@ -1331,6 +1331,13 @@ class WebApp:
             except Exception:  # noqa: BLE001
                 uptime = None
             sync_status = getattr(state, "sync_status", SyncStatus.LIVE)
+            try:
+                _sh = list(state.stats_history) if state.stats_history else []
+            except RuntimeError:
+                try:
+                    _sh = list(state.stats_history) if state.stats_history else []
+                except Exception:  # noqa: BLE001
+                    _sh = []
             result.append({
                 "node_id": state.entry.node_id,
                 "alias": state.entry.alias,
@@ -1342,6 +1349,6 @@ class WebApp:
                 "last_seen": _rel(state.last_seen),
                 "tags": ", ".join(trusted.tags) if trusted and trusted.tags else None,
                 "last_stats": state.last_stats,
-                "stats_history": list(state.stats_history) if state.stats_history else [],
+                "stats_history": _sh,
             })
         return result
