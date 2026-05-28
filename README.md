@@ -290,8 +290,9 @@ panic-monitor --init && panic-monitor --install-service
 ## Architecture
 
 - **Log is authority** -- `peers.json` is a cache re-materialized after each signed append
-- **Pull-based stats** -- peers pull each other's dashboards over STATUS_ALPN every `--stats-interval`
+- **Delta-based stats pull** -- peers pull each other's stats over STATUS_ALPN every `--stats-interval` using monotonic sequence cursors. First pull = ~50 KB; subsequent pulls = ~5-20 KB (just the new entries since the cursor).
 - **Iroh handles NAT** -- no public IPs or port forwarding required
 - **Five custom ALPNs** -- heartbeat, push, status, logs, sync (see [docs/protocols/](docs/protocols/))
+- **Uni-stream protocol** -- request/response over two unidirectional QUIC streams (bi-streams proved unreliable in iroh 0.35.0 Python bindings)
 - **Concurrency** -- one asyncio loop (iroh + scheduler), threads for control socket and HTTP dashboards
 - **Retention** -- raw snapshots 2h, 5-min buckets 30d, hourly + daily summaries indefinitely

@@ -61,24 +61,51 @@ SYNC_RESPONSE_MAX = 32 * 1024 * 1024   # 32 MiB cap on sync payload
 MAX_CONCURRENT_PROBES = 50  # cap concurrent outbound connections per cycle
 
 
+# Tracks the last-known network path per peer node_id. When iroh switches a
+# peer's path (e.g., from public IPv6 to LAN IPv4 after a network change),
+# the next _log_conn_type call surfaces it as a WARNING so the operator sees
+# the transition in real time instead of having to grep timestamps.
+_last_known_path: dict[str, str] = {}
+
+
+def _path_signature(info) -> tuple[str, str]:
+    """Return (short_type, full_descriptor) for a remote_info conn_type."""
+    ct = info.conn_type.type()
+    if ct == iroh.ConnType.DIRECT:
+        return ("direct", f"direct (hole-punched) {info.conn_type.as_direct()}")
+    if ct == iroh.ConnType.RELAY:
+        return ("relay", f"relay {info.conn_type.as_relay()}")
+    if ct == iroh.ConnType.MIXED:
+        mixed = info.conn_type.as_mixed()
+        return ("mixed", f"mixed  direct={mixed.addr}  relay={mixed.relay_url}")
+    return ("none", "none")
+
+
 async def _log_conn_type(net, node_id_str: str, label: str, tag: str) -> None:
-    """Query iroh for the connection type to a remote node and log it."""
+    """Query iroh for the connection type to a remote node and log it.
+
+    Also detects path changes — when the descriptor for a peer changes from
+    the previously-seen value, emits a WARNING with the before/after so
+    operators can see at-a-glance when iroh swapped transports.
+    """
     try:
         pub_key = iroh.PublicKey.from_string(node_id_str)
         info = await net.remote_info(pub_key)
         if not info:
             logger.debug("[{}] {} connection type unknown (no remote info)", tag, label)
             return
-        ct = info.conn_type.type()
-        if ct == iroh.ConnType.DIRECT:
-            logger.info("[{}] {} connected via direct (hole-punched) {}", tag, label, info.conn_type.as_direct())
-        elif ct == iroh.ConnType.RELAY:
-            logger.info("[{}] {} connected via relay {}", tag, label, info.conn_type.as_relay())
-        elif ct == iroh.ConnType.MIXED:
-            mixed = info.conn_type.as_mixed()
-            logger.info("[{}] {} connected via mixed  direct={}  relay={}", tag, label, mixed.addr, mixed.relay_url)
-        else:
+        short, desc = _path_signature(info)
+        if short == "none":
             logger.debug("[{}] {} connection type: none", tag, label)
+            return
+        prev = _last_known_path.get(node_id_str)
+        if prev is not None and prev != desc:
+            logger.warning(
+                "[path] {} switched transport: {}  →  {}",
+                label, prev, desc,
+            )
+        _last_known_path[node_id_str] = desc
+        logger.info("[{}] {} connected via {}", tag, label, desc)
     except Exception as exc:
         logger.debug("[{}] {} failed to query connection type: {}", tag, label, exc)
 
