@@ -47,7 +47,7 @@ EV_SYSTEM_HIGH_CPU = "system_high_cpu"
 EV_SYSTEM_HIGH_MEM = "system_high_mem"
 EV_DISK_NEAR_FULL = "disk_near_full"
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -174,6 +174,7 @@ class LogStore:
         self._conn.executescript(_SCHEMA)
         self._migrate_event_timestamps()
         self._migrate_event_dedupe()
+        self._migrate_snapshot_seq()
         logger.info("[logstore] opened {}", self._path)
 
     def _has_column(self, table: str, column: str) -> bool:
@@ -298,6 +299,32 @@ class LogStore:
                     "[logstore] migrated {} event timestamps to ms precision", stale
                 )
 
+    def _migrate_snapshot_seq(self) -> None:
+        """Add monotonic ``seq`` column to raw_snapshots for delta pulls."""
+        if not self._table_exists("raw_snapshots"):
+            return
+        if self._has_column("raw_snapshots", "seq"):
+            return
+        with self._lock:
+            self._conn.execute("ALTER TABLE raw_snapshots ADD COLUMN seq INTEGER")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_raw_peer_seq "
+                "ON raw_snapshots(peer_node_id, seq)"
+            )
+            own = self._own_node_id or "self"
+            self._conn.execute(
+                "UPDATE raw_snapshots SET seq = rowid WHERE peer_node_id = ? AND seq IS NULL",
+                (own,),
+            )
+            logger.info("[logstore] migrated raw_snapshots: added seq column")
+
+    def _next_seq(self, peer_node_id: str) -> int:
+        cur = self._conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM raw_snapshots WHERE peer_node_id = ?",
+            (peer_node_id,),
+        )
+        return cur.fetchone()[0]
+
     def close(self) -> None:
         with self._lock:
             try:
@@ -350,22 +377,22 @@ class LogStore:
     # Raw snapshots
     # ------------------------------------------------------------------
 
-    def record_snapshot(self, snap_dict: dict) -> None:
-        """Insert a raw snapshot. Pruning is handled by hourly ``prune()``.
+    def record_snapshot(self, snap_dict: dict) -> int:
+        """Insert a raw snapshot and return its sequence number.
 
-        Previously this method ran a per-call ``DELETE WHERE ts < cutoff``,
-        which fires every ``stats_interval`` (10 s by default). The hourly
-        retention job already enforces RAW_RETAIN_HOURS, so per-tick deletes
-        were pure WAL churn — gone.
+        Pruning is handled by the hourly ``prune()`` job.
         """
         ts = _to_epoch(datetime.now(IST))
         payload = json.dumps(snap_dict)
         own = self._own_node_id or "self"
         with self._lock:
+            seq = self._next_seq(own)
             self._conn.execute(
-                "INSERT OR REPLACE INTO raw_snapshots (peer_node_id, ts, payload) VALUES (?, ?, ?)",
-                (own, ts, payload),
+                "INSERT OR REPLACE INTO raw_snapshots (peer_node_id, ts, payload, seq) "
+                "VALUES (?, ?, ?, ?)",
+                (own, ts, payload, seq),
             )
+            return seq
 
     def get_raw_snapshots(
         self,
@@ -384,6 +411,39 @@ class LogStore:
             )
             rows = cur.fetchall()
         return [json.loads(r[0]) for r in rows]
+
+    def get_delta_since_seq(self, since_seq: int, peer_node_id: Optional[str] = None) -> dict:
+        """Return lightweight snapshot entries with seq > since_seq.
+
+        Strips ``processes`` and ``containers`` from history entries to keep
+        the payload small.  The caller includes the full latest snapshot
+        separately as ``own_stats``.
+        """
+        nid = peer_node_id if peer_node_id is not None else (self._own_node_id or "self")
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT seq, payload FROM raw_snapshots "
+                "WHERE peer_node_id = ? AND seq > ? ORDER BY seq ASC",
+                (nid, since_seq),
+            )
+            rows = cur.fetchall()
+            cur2 = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM raw_snapshots WHERE peer_node_id = ?",
+                (nid,),
+            )
+            latest_seq = cur2.fetchone()[0]
+
+        entries = []
+        for seq_val, raw in rows:
+            snap = json.loads(raw)
+            entries.append({
+                "seq": seq_val,
+                "timestamp": snap.get("timestamp"),
+                "cpu_percent": snap.get("cpu_percent"),
+                "mem_percent": snap.get("mem_percent"),
+                "disk_percent": snap.get("disk_percent"),
+            })
+        return {"latest_seq": latest_seq, "entries": entries}
 
     # ------------------------------------------------------------------
     # Rollup jobs

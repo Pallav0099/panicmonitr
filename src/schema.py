@@ -74,6 +74,8 @@ class PeerState:
         "sync_status",
         "last_sync_ts",
         "has_dashboard_gap",
+        # Delta pull cursor
+        "last_pulled_seq",
     )
 
     def __init__(self, entry: PeerEntry) -> None:
@@ -95,3 +97,4 @@ class PeerState:
         self.sync_status: SyncStatus = SyncStatus.LIVE
         self.last_sync_ts: Optional[datetime] = None
         self.has_dashboard_gap: bool = False
+        self.last_pulled_seq: int = 0

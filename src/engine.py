@@ -169,24 +169,22 @@ async def _read_framed(recv_stream, max_size: int) -> bytes:
 
 
 class StatusProtocol:
-    """Accepts inbound dashboard-fetch requests on ALPN ``panic-monitor/status/0``.
+    """Accepts inbound stats-pull requests on ALPN ``panic-monitor/status/0``.
 
-    Wire protocol
-    -------------
-    Server opens a unidirectional stream to the client.
+    Wire protocol (v2 — delta-based)
+    ---------------------------------
+    Two unidirectional streams: client → server (cursor), server → client (delta).
 
     Flow:
-      1. Client: ``endpoint.connect(addr, STATUS_ALPN)``
-      2. Server: verifies ``view_dashboard`` or ``monitor`` permission
-      3. Server: ``conn.open_uni()`` → writes length-prefixed JSON payload
-      4. Server: ``send.finish()``; ``conn.close(0, b"done")``
-      5. Client: ``conn.accept_uni()`` → ``_read_framed(recv, STATUS_RESPONSE_MAX)``
+      1. Client: ``conn.open_uni()`` → ``{"since_seq": N}``  (0 = first pull)
+      2. Server: reads cursor, computes delta from logstore
+      3. Server: ``conn.open_uni()`` → ``{"own_stats": {...}, "latest_seq": M, "entries": [...]}``
+      4. Server: ``conn.close(0, b"done")``
 
-    Max payload: 2 MiB (``STATUS_RESPONSE_MAX``).
-    Timeout: ``FETCH_TIMEOUT_SECONDS`` (30 s).
+    ``own_stats`` is always the full latest snapshot (with processes/containers).
+    ``entries`` contains only lightweight chart data (cpu/mem/disk/ts) since the cursor.
 
     Auth: ``view_dashboard`` or ``monitor`` permission.
-    Note: ``conn.remote_node_id()`` is synchronous — no await.
     """
 
     def __init__(self, creator: "StatusProtocolCreator") -> None:
@@ -217,17 +215,32 @@ class StatusProtocol:
             return
 
         try:
-            snapshot = build_dashboard_snapshot(engine)
-            payload = json.dumps(snapshot).encode("utf-8")
+            recv_stream = await asyncio.wait_for(conn.accept_uni(), timeout=10)
+            req_bytes = await asyncio.wait_for(_read_framed(recv_stream, 1024), timeout=10)
+            req = json.loads(req_bytes.decode("utf-8"))
+            since_seq = int(req.get("since_seq", 0))
+
+            own_stats = engine.get_own_stats()
+            delta = {"latest_seq": 0, "entries": []}
+            if engine.logstore is not None:
+                delta = engine.logstore.get_delta_since_seq(since_seq)
+
+            response = {
+                "own_stats": own_stats,
+                "latest_seq": delta["latest_seq"],
+                "entries": delta["entries"],
+            }
+            payload = json.dumps(response).encode("utf-8")
             send_stream = await asyncio.wait_for(conn.open_uni(), timeout=10)
             await send_stream.write_all(struct.pack(">I", len(payload)) + payload)
             await send_stream.finish()
             logger.info(
-                "[status.accept] delivered dashboard ({} bytes) to {}",
-                len(payload), remote[:12],
+                "[status.accept] delta ({} bytes, {} entries, seq {}→{}) to {}",
+                len(payload), len(delta["entries"]),
+                since_seq, delta["latest_seq"], remote[:12],
             )
         except Exception as exc:
-            logger.error("[status.accept] send failed: {}: {}", type(exc).__name__, exc)
+            logger.error("[status.accept] failed: {}: {}", type(exc).__name__, exc)
         conn.close(0, b"done")
 
     async def shutdown(self) -> None:
@@ -1239,8 +1252,11 @@ class MonitorEngine:
             await self._pull_one_peer_dashboard_inner(node_id)
 
     async def _pull_one_peer_dashboard_inner(self, node_id: str) -> None:
+        state = self._devices.get(node_id)
+        since_seq = state.last_pulled_seq if state is not None else 0
+
         try:
-            snap = await self.fetch_peer_dashboard(node_id)
+            resp = await self.fetch_peer_dashboard(node_id, since_seq=since_seq)
         except Exception as exc:  # noqa: BLE001
             msg = exc.message() if hasattr(exc, "message") else str(exc)
             logger.info(
@@ -1249,30 +1265,29 @@ class MonitorEngine:
             )
             return
 
-        own_stats = snap.get("own_stats")
-        own_history = snap.get("own_stats_history") or []
+        own_stats = resp.get("own_stats")
+        entries = resp.get("entries") or []
+        latest_seq = resp.get("latest_seq", since_seq)
 
-        state = self._devices.get(node_id)
         if state is not None:
             if own_stats is not None:
                 state.last_stats = own_stats
-                state.stats_history.append(own_stats)
+            for e in entries:
+                state.stats_history.append(e)
+            state.last_pulled_seq = latest_seq
             if state.has_dashboard_gap:
                 state.has_dashboard_gap = False
 
+        n_entries = len(entries)
         if own_stats is not None:
-            cpu = own_stats.get("cpu_percent")
-            mem = own_stats.get("mem_percent")
             logger.info(
-                "[stats-pull] {} ok  cpu={}%  mem={}%",
-                node_id[:12], cpu, mem,
+                "[stats-pull] {} ok  cpu={}%  mem={}%  delta={} entries  seq {}→{}",
+                node_id[:12], own_stats.get("cpu_percent"),
+                own_stats.get("mem_percent"), n_entries, since_seq, latest_seq,
             )
 
         if self._logstore is None or own_stats is None:
             return
-        # Mirror the latest snapshot into our logstore, keyed by the peer.
-        # merge_sync_payload uses (peer_node_id, ts) idempotency, so we
-        # stamp the snapshot with the time we received it.
         stamped = dict(own_stats)
         stamped.setdefault("ts", datetime.now(IST).isoformat())
         try:
@@ -1560,10 +1575,12 @@ class MonitorEngine:
         )
         return result
 
-    async def fetch_peer_dashboard(self, target: str) -> dict:
-        """Pull the status dashboard from a peer we granted ``view_dashboard``.
+    async def fetch_peer_dashboard(self, target: str, since_seq: int = 0) -> dict:
+        """Pull a stats delta from a peer over STATUS_ALPN.
 
-        *target* is an alias or hex NodeID. Raises on auth failure / timeout.
+        Sends ``{"since_seq": N}`` and receives a delta response with
+        ``own_stats`` (full latest snapshot) plus lightweight ``entries``
+        (chart data only, seq > N).
         """
         if self._iroh is None:
             raise RuntimeError("engine not initialized")
@@ -1583,6 +1600,10 @@ class MonitorEngine:
         )
         conn.remote_node_id()  # force handshake — connect() returns a lazy handle
         try:
+            send_stream = await asyncio.wait_for(conn.open_uni(), timeout=FETCH_TIMEOUT_SECONDS)
+            request_body = json.dumps({"since_seq": since_seq}).encode("utf-8")
+            await _write_framed(send_stream, request_body)
+            await send_stream.finish()
             recv_stream = await asyncio.wait_for(
                 conn.accept_uni(), timeout=FETCH_TIMEOUT_SECONDS
             )
@@ -1595,7 +1616,7 @@ class MonitorEngine:
             try:
                 conn.close(0, b"done")
             except Exception:  # noqa: BLE001 S110
-                pass  # best-effort conn cleanup
+                pass
 
     async def fetch_peer_container_logs(self, target: str, cid: str, tail: int = 20) -> dict:
         """Pull container logs from a peer over LOGS_ALPN."""
