@@ -412,26 +412,29 @@ class LogStore:
             rows = cur.fetchall()
         return [json.loads(r[0]) for r in rows]
 
-    def get_delta_since_seq(self, since_seq: int, peer_node_id: Optional[str] = None) -> dict:
+    def get_delta_since_seq(
+        self, since_seq: int, peer_node_id: Optional[str] = None, max_entries: int = 360
+    ) -> dict:
         """Return lightweight snapshot entries with seq > since_seq.
 
         Strips ``processes`` and ``containers`` from history entries to keep
-        the payload small.  The caller includes the full latest snapshot
-        separately as ``own_stats``.
+        the payload small.  Capped to *max_entries* most recent rows so a
+        first pull (since_seq=0) doesn't dump the entire ring buffer.
         """
         nid = peer_node_id if peer_node_id is not None else (self._own_node_id or "self")
         with self._lock:
             cur = self._conn.execute(
-                "SELECT seq, payload FROM raw_snapshots "
-                "WHERE peer_node_id = ? AND seq > ? ORDER BY seq ASC",
-                (nid, since_seq),
-            )
-            rows = cur.fetchall()
-            cur2 = self._conn.execute(
                 "SELECT COALESCE(MAX(seq), 0) FROM raw_snapshots WHERE peer_node_id = ?",
                 (nid,),
             )
-            latest_seq = cur2.fetchone()[0]
+            latest_seq = cur.fetchone()[0]
+            effective_since = max(since_seq, latest_seq - max_entries)
+            cur = self._conn.execute(
+                "SELECT seq, payload FROM raw_snapshots "
+                "WHERE peer_node_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
+                (nid, effective_since, max_entries),
+            )
+            rows = cur.fetchall()
 
         entries = []
         for seq_val, raw in rows:
