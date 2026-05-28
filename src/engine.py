@@ -215,10 +215,18 @@ class StatusProtocol:
             return
 
         try:
+            # Read client request first — keeps the connection bidirectionally
+            # active so iroh doesn't tear it down between server finish() and
+            # client read completion (same pattern as SYNC protocol).
+            recv_stream = await asyncio.wait_for(conn.accept_uni(), timeout=10)
+            req_bytes = await asyncio.wait_for(_read_framed(recv_stream, 1024), timeout=10)
+            req = json.loads(req_bytes.decode("utf-8"))
+            since_seq = int(req.get("since_seq", 0))
+
             own_stats = engine.get_own_stats()
             delta = {"latest_seq": 0, "entries": []}
             if engine.logstore is not None:
-                delta = engine.logstore.get_delta_since_seq(0)
+                delta = engine.logstore.get_delta_since_seq(since_seq)
 
             response = {
                 "own_stats": own_stats,
@@ -227,12 +235,12 @@ class StatusProtocol:
             }
             payload = json.dumps(response).encode("utf-8")
             send_stream = await asyncio.wait_for(conn.open_uni(), timeout=10)
-            await send_stream.write_all(payload)
+            await _write_framed(send_stream, payload)
             await send_stream.finish()
             logger.info(
-                "[status.accept] sent ({} bytes, {} entries, seq→{}) to {}",
+                "[status.accept] sent ({} bytes, {} entries, seq {}→{}) to {}",
                 len(payload), len(delta["entries"]),
-                delta["latest_seq"], remote[:12],
+                since_seq, delta["latest_seq"], remote[:12],
             )
         except Exception as exc:
             logger.error("[status.accept] failed: {}: {}", type(exc).__name__, exc)
@@ -1592,14 +1600,23 @@ class MonitorEngine:
         )
         conn.remote_node_id()  # force handshake — connect() returns a lazy handle
         try:
+            # Send request first (mirrors SYNC pattern). This keeps the
+            # connection bidirectionally active so it doesn't get torn down
+            # before we read the response.
+            send_stream = await asyncio.wait_for(
+                conn.open_uni(), timeout=FETCH_TIMEOUT_SECONDS
+            )
+            request_body = json.dumps({"since_seq": since_seq}).encode("utf-8")
+            await _write_framed(send_stream, request_body)
+            await send_stream.finish()
             recv_stream = await asyncio.wait_for(
                 conn.accept_uni(), timeout=FETCH_TIMEOUT_SECONDS
             )
-            raw = await asyncio.wait_for(
-                recv_stream.read_to_end(STATUS_RESPONSE_MAX),
+            payload = await asyncio.wait_for(
+                _read_framed(recv_stream, STATUS_RESPONSE_MAX),
                 timeout=FETCH_TIMEOUT_SECONDS,
             )
-            return json.loads(raw.decode("utf-8"))
+            return json.loads(payload.decode("utf-8"))
         finally:
             try:
                 conn.close(0, b"done")
