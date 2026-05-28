@@ -241,7 +241,6 @@ class StatusProtocol:
             )
         except Exception as exc:
             logger.error("[status.accept] failed: {}: {}", type(exc).__name__, exc)
-        conn.close(0, b"done")
 
     async def shutdown(self) -> None:
         logger.debug("Status protocol shutting down")
@@ -366,7 +365,6 @@ class ContainerLogsProtocol:
             await send_stream.finish()
         except Exception as exc:
             logger.error("[logs.accept] failed: {}: {}", type(exc).__name__, exc)
-        conn.close(0, b"done")
 
     async def shutdown(self) -> None:
         logger.debug("Container logs protocol shutting down")
@@ -541,7 +539,6 @@ class SyncProtocol:
             )
         except Exception as exc:
             logger.error("[sync.accept] send failed: {}: {}", type(exc).__name__, exc)
-        conn.close(0, b"sync done")
 
     async def shutdown(self) -> None:
         logger.debug("Sync protocol shutting down")
