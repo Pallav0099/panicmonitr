@@ -275,6 +275,20 @@ failed to bind. Check: `systemctl --user is-active panic-monitor.service`
 **Peer alive but no stats** -- the remote hasn't granted you `monitor` or
 `view_dashboard`. Both sides need `--add-peer` with at least `monitor`.
 
+**`[stats-pull] X failed: IrohError: connection lost / reset by peer` while
+serve direction works** -- if BOTH peers run Docker, both have `docker0` at
+`172.17.0.1`. iroh enumerates local interfaces and announces them in
+discovery, so the remote announces `172.17.0.1:<port>` as one of its
+candidate addresses. Your iroh tries it, and the packet routes through
+your own `docker0`, looping back to your machine instead of reaching the
+peer. Heartbeat survives (single packet); sustained stream pulls fail.
+Confirm with `sudo tcpdump -i lo -nn 'udp and host 172.17.0.1'` -- if you
+see your own loopback traffic during pulls, this is the issue. Workaround:
+`sudo ip link set docker0 down` for a quick test (containers become
+unreachable until you bring it back up). Long-term fix is upstream
+(iroh filtering private addresses from discovery). Tracked in
+[docs/network-resilience-roadmap.md](docs/network-resilience-roadmap.md).
+
 **Invalid Node ID** -- Node IDs are Curve25519 public keys. Use the value
 from `--show-identity`, not a hand-typed hex string.
 

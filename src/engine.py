@@ -271,6 +271,15 @@ class StatusProtocol:
             )
         except Exception as exc:
             logger.error("[status.accept] failed: {}: {}", type(exc).__name__, exc)
+        # Wait for the client to close the connection before letting this
+        # handler return. iroh tears down the conn when accept() exits, and
+        # send_stream.finish() does NOT wait for the receiver to drain — on
+        # slow paths the close races ahead of the last bytes, the client sees
+        # "closed by peer: 0" mid-read, and the pull fails.
+        try:
+            await asyncio.wait_for(conn.closed(), timeout=FETCH_TIMEOUT_SECONDS)
+        except Exception:  # noqa: BLE001 S110
+            pass
 
     async def shutdown(self) -> None:
         logger.debug("Status protocol shutting down")
@@ -395,6 +404,12 @@ class ContainerLogsProtocol:
             await send_stream.finish()
         except Exception as exc:
             logger.error("[logs.accept] failed: {}: {}", type(exc).__name__, exc)
+        # Hold the connection open until the client closes — see status.accept
+        # for the rationale. finish() doesn't wait for the receiver.
+        try:
+            await asyncio.wait_for(conn.closed(), timeout=FETCH_TIMEOUT_SECONDS)
+        except Exception:  # noqa: BLE001 S110
+            pass
 
     async def shutdown(self) -> None:
         logger.debug("Container logs protocol shutting down")
@@ -569,6 +584,12 @@ class SyncProtocol:
             )
         except Exception as exc:
             logger.error("[sync.accept] send failed: {}: {}", type(exc).__name__, exc)
+        # Hold the connection open until the client closes — see status.accept
+        # for the rationale. finish() doesn't wait for the receiver.
+        try:
+            await asyncio.wait_for(conn.closed(), timeout=FETCH_TIMEOUT_SECONDS)
+        except Exception:  # noqa: BLE001 S110
+            pass
 
     async def shutdown(self) -> None:
         logger.debug("Sync protocol shutting down")
@@ -1282,14 +1303,46 @@ class MonitorEngine:
         state = self._devices.get(node_id)
         since_seq = state.last_pulled_seq if state is not None else 0
 
+        resp: dict | None = None
         try:
             resp = await self.fetch_peer_dashboard(node_id, since_seq=since_seq)
         except Exception as exc:  # noqa: BLE001
             msg = exc.message() if hasattr(exc, "message") else str(exc)
-            logger.info(
-                "[stats-pull] {} failed: {}: {}",
-                node_id[:12], type(exc).__name__, msg,
+            # Adaptive fallback: if the direct path mid-stream-broke
+            # ("reset by peer" / "connection lost"), try once more with
+            # relay-preferred addressing. We don't force relay globally —
+            # only for the retry on this specific peer this cycle.
+            lowered = msg.lower()
+            transient = (
+                "reset by peer" in lowered
+                or "connection lost" in lowered
+                or "timed out" in lowered
+                or isinstance(exc, asyncio.TimeoutError)
             )
+            if transient:
+                logger.info(
+                    "[stats-pull] {} direct failed ({}: {}), retrying via relay",
+                    node_id[:12], type(exc).__name__, msg,
+                )
+                try:
+                    resp = await self.fetch_peer_dashboard(
+                        node_id, since_seq=since_seq, prefer_relay=True
+                    )
+                    logger.info("[stats-pull] {} recovered via relay", node_id[:12])
+                except Exception as exc2:  # noqa: BLE001
+                    msg2 = exc2.message() if hasattr(exc2, "message") else str(exc2)
+                    logger.info(
+                        "[stats-pull] {} relay retry also failed: {}: {}",
+                        node_id[:12], type(exc2).__name__, msg2,
+                    )
+                    return
+            else:
+                logger.info(
+                    "[stats-pull] {} failed: {}: {}",
+                    node_id[:12], type(exc).__name__, msg,
+                )
+                return
+        if resp is None:
             return
 
         own_stats = resp.get("own_stats")
@@ -1602,12 +1655,19 @@ class MonitorEngine:
         )
         return result
 
-    async def fetch_peer_dashboard(self, target: str, since_seq: int = 0) -> dict:
+    async def fetch_peer_dashboard(
+        self, target: str, since_seq: int = 0, prefer_relay: bool = False
+    ) -> dict:
         """Pull a stats delta from a peer over STATUS_ALPN.
 
         Sends ``{"since_seq": N}`` and receives a delta response with
         ``own_stats`` (full latest snapshot) plus lightweight ``entries``
         (chart data only, seq > N).
+
+        When ``prefer_relay`` is True, the NodeAddr is built with the peer's
+        cached home-relay URL and no direct addresses, hinting iroh to skip
+        the direct path that just failed. Used by the adaptive retry in
+        ``_pull_one_peer_dashboard_inner`` — never the first attempt.
         """
         if self._iroh is None:
             raise RuntimeError("engine not initialized")
@@ -1620,12 +1680,42 @@ class MonitorEngine:
             pub_key = iroh.PublicKey.from_string(target_node_id)
         except iroh.iroh_ffi.IrohError as exc:
             raise ValueError(f"invalid node_id: {exc}")
-        addr = iroh.NodeAddr(pub_key, None, [])
+
+        net = self._iroh.net()
+        relay_url: str | None = None
+        if prefer_relay:
+            try:
+                info = await net.remote_info(pub_key)
+                if info is not None:
+                    ru = info.relay_url
+                    if ru:
+                        relay_url = ru.url if hasattr(ru, "url") else str(ru)
+            except Exception:  # noqa: BLE001
+                pass
+            if relay_url is None:
+                logger.debug(
+                    "[status.pull] {} prefer_relay requested but no cached relay url; "
+                    "falling through to default addressing",
+                    target_node_id[:12],
+                )
+
+        addr = iroh.NodeAddr(pub_key, relay_url, [])
         endpoint = self._iroh.node().endpoint()
         conn = await asyncio.wait_for(
             endpoint.connect(addr, STATUS_ALPN), timeout=FETCH_TIMEOUT_SECONDS
         )
         conn.remote_node_id()  # force handshake — connect() returns a lazy handle
+
+        # Log the path iroh actually picked for this pull (direct/relay/mixed).
+        # Best-effort — never fail the pull just because path introspection did.
+        try:
+            await asyncio.wait_for(
+                _log_conn_type(net, target_node_id, target_node_id[:12], "status.pull"),
+                timeout=2,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
         try:
             # Send request first (mirrors SYNC pattern). This keeps the
             # connection bidirectionally active so it doesn't get torn down
