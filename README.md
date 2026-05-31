@@ -30,6 +30,10 @@ an append-only, cryptographically signed log per node.
 - **Cryptographic audit trail** -- every trust mutation and state transition is signed
 - **Local-first storage** -- SQLite history + logstore, no external services
 
+<p align="center">
+  <img src="assets/monitr-dashboard.webp" alt="Panic Monitor dashboard — global status bar, monitor sidebar, multi-window uptime, heartbeat history, latency sparkline, and incident log" width="900">
+</p>
+
 ---
 
 ## Quick start
@@ -153,6 +157,13 @@ for glancing, not reading:
   system/process/container/log depth.
 - **Incident history** -- a dedicated full-history page at
   `/incidents/<node_id>` for reading days of outages without scrubbing.
+
+Open any node to read its whole system -- live, straight off the peer:
+
+<p align="center">
+  <img src="assets/monitr-processes.webp" alt="Live process table — top processes by CPU and memory pulled off a peer over P2P" width="48%">
+  <img src="assets/monitr-containers.webp" alt="Docker diagnostics — per-container CPU/MEM/net/IO, health, ports and logs over iroh" width="48%">
+</p>
 
 See [docs/dashboard.md](docs/dashboard.md) for the full UI reference.
 
