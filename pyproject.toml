@@ -2,7 +2,14 @@
 name = "panic-monitor"
 version = "0.1.0"
 description = "P2P health monitoring daemon for the PanicLab ecosystem"
+readme = "README.md"
+license = { text = "AGPL-3.0-or-later" }
 requires-python = ">=3.12"
+classifiers = [
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: POSIX :: Linux",
+]
 dependencies = [
     "iroh==0.35.0",
     "pydantic>=2.0",

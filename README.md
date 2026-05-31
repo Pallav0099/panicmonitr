@@ -369,7 +369,21 @@ capability than read-only monitoring: signed commands, a dedicated per-peer
 
 ---
 
-## Free & open source
+## License
 
-Panic Monitor is FOSS, local-first, and yours. No telemetry, no accounts, no
-upstream service -- you hold the keys and own the data, by design.
+Panic Monitor is free and open-source software under the **GNU Affero General
+Public License v3.0 or later** ([AGPL-3.0-or-later](LICENSE)). Run it, study it,
+modify it, and share it freely -- local-first, no telemetry, no accounts, you
+hold the keys and own the data. The one obligation: if you run a modified
+version as a network service, the AGPL requires you to offer its users the
+corresponding source.
+
+**Commercial licensing.** If you can't meet the AGPL's terms -- e.g. you want to
+embed Panic Monitor in a closed-source product, or offer it as a managed service
+without releasing your source -- a separate commercial license is available.
+Open an issue or contact the maintainer to discuss terms.
+
+<!-- TODO: replace with your commercial-licensing contact email -->
+
+> Individuals and homelabbers: use it freely under the AGPL, forever.
+> Companies that can't comply with the AGPL: reach out for a commercial license.
