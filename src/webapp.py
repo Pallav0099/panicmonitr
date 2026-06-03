@@ -242,6 +242,24 @@ body {
   transition: all 0.15s;
 }
 .btn:hover { background: var(--accent); color: var(--bg-primary); box-shadow: var(--glow); }
+.btn-mini { padding: 1px 6px; font-size: 0.55rem; letter-spacing: 1px; margin-left: 6px; }
+
+/* ─── Add-peer form ─────────────────────────────────────────────────── */
+.sidebar-col { display: flex; flex-direction: column; gap: 1.2rem; position: sticky; top: 72px; }
+@media (max-width: 820px) { .sidebar-col { position: static; } }
+#add-peer-card { display: flex; flex-direction: column; gap: 8px; }
+.ap-input {
+  background: var(--bg-primary); border: 1px solid var(--border-soft);
+  color: var(--text-bright); font-family: inherit; font-size: 0.66rem;
+  padding: 5px 8px; width: 100%; box-sizing: border-box;
+}
+.ap-input:focus { outline: none; border-color: var(--accent); }
+.ap-perms { display: flex; flex-direction: column; gap: 3px; }
+.ap-perms label { color: var(--text-dim); font-size: 0.64rem; cursor: pointer; display: flex; align-items: center; gap: 6px; }
+.ap-perms input { accent-color: var(--accent); }
+.ap-msg { font-size: 0.62rem; min-height: 0.9rem; letter-spacing: 0.5px; }
+.ap-msg.error { color: var(--red); }
+.ap-msg.ok { color: var(--accent); }
 
 /* ─── Terminal ──────────────────────────────────────────────────────── */
 .term-controls { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
@@ -254,6 +272,12 @@ body {
 }
 .term-note { margin-top: 8px; font-size: 0.6rem; color: var(--text-dim); }
 .term-note code { color: var(--accent); }
+
+/* ─── Remove peer ───────────────────────────────────────────────────── */
+.rp-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.rp-confirm { display: inline-flex; align-items: center; gap: 8px; font-size: 0.66rem; color: var(--red); letter-spacing: 0.5px; }
+.btn.rp-danger { border-color: var(--red); color: var(--red); }
+.btn.rp-danger:hover { background: var(--red); color: var(--bg-primary); box-shadow: none; }
 
 /* ─── Layout: sidebar monitor list + detail pane ────────────────────── */
 /* Both columns are wrapped in translucent "tray" panels (paniclab design
@@ -519,7 +543,8 @@ footer.foot {
     <div class="gb-right">
       <span><span class="live-dot" id="live-dot"></span><span id="status-text">connecting…</span></span>
       <span style="color: var(--text-faint)">|</span>
-      <span>node: <span class="nodeid" id="node-val">—</span></span>
+      <span>node: <span class="nodeid" id="node-val" title="click to copy full node id">—</span>
+        <button class="btn btn-mini" id="node-copy" title="copy full node id">copy</button></span>
       <div class="controls">
         <label for="interval">refresh</label>
         <select id="interval">
@@ -537,7 +562,21 @@ footer.foot {
 
   <div class="layout">
     <!-- Monitor list (sidebar) -->
-    <div class="sidebar tray" id="sidebar"></div>
+    <div class="sidebar-col">
+      <div class="card" id="add-peer-card">
+        <div class="card-label">[Add node]</div>
+        <input class="ap-input" id="ap-nodeid" placeholder="64-char node id" maxlength="64" spellcheck="false" autocomplete="off">
+        <input class="ap-input" id="ap-alias" placeholder="alias (optional)" maxlength="64" autocomplete="off">
+        <div class="ap-perms">
+          <label><input type="checkbox" id="ap-monitor" checked> monitor</label>
+          <label><input type="checkbox" id="ap-dash"> view_dashboard</label>
+          <label><input type="checkbox" id="ap-shell"> shell</label>
+        </div>
+        <button class="btn" id="ap-submit">[Add peer]</button>
+        <div class="ap-msg" id="ap-msg"></div>
+      </div>
+      <div class="sidebar tray" id="sidebar"></div>
+    </div>
 
     <!-- Detail pane (always shows the selected node) -->
     <div class="detail-pane tray" id="detail-pane">
@@ -672,6 +711,20 @@ footer.foot {
       <div class="term-note">Live PTY over iroh. Requires the <code>shell</code> permission granted by the remote node.</div>
     </div>
 
+    <div class="card" id="remove-peer-card" style="display:none">
+      <div class="card-label">[Remove peer]</div>
+      <div class="rp-controls">
+        <button class="btn rp-danger" id="rp-remove">Remove peer</button>
+        <span class="rp-confirm" id="rp-confirm" style="display:none">
+          are you sure you want to remove the peer?
+          <button class="btn rp-danger" id="rp-yes">Yes, remove</button>
+          <button class="btn" id="rp-no">Cancel</button>
+        </span>
+        <span class="term-status" id="rp-status"></span>
+      </div>
+      <div class="term-note">Revokes trust for this peer (signed, auditable). They can no longer probe, pull stats, or open a shell on this node.</div>
+    </div>
+
     </div><!-- /detail-pane -->
   </div><!-- /layout -->
 
@@ -712,6 +765,7 @@ footer.foot {
   const liveDot = $('live-dot');
   const statusText = $('status-text');
   const nodeVal = $('node-val');
+  const nodeCopy = $('node-copy');
   const intervalEl = $('interval');
   const refreshBtn = $('refresh-now');
 
@@ -945,6 +999,55 @@ footer.foot {
   termOpenBtn.onclick = () => { if (selectedNodeId) openTerminal(selectedNodeId); };
   termCloseBtn.onclick = closeTerminal;
 
+  // ── Remove peer ──────────────────────────────────────────────────────
+  const rpCard = $('remove-peer-card');
+  const rpRemoveBtn = $('rp-remove');
+  const rpConfirm = $('rp-confirm');
+  const rpYes = $('rp-yes');
+  const rpNo = $('rp-no');
+  const rpStatus = $('rp-status');
+  let rpLastNid = null;
+
+  function resetRemoveUI() {
+    rpConfirm.style.display = 'none';
+    rpRemoveBtn.style.display = 'inline-block';
+    rpStatus.textContent = '';
+    rpStatus.className = 'term-status';
+  }
+
+  rpRemoveBtn.onclick = () => {
+    rpRemoveBtn.style.display = 'none';
+    rpConfirm.style.display = 'inline-flex';
+  };
+  rpNo.onclick = resetRemoveUI;
+
+  rpYes.onclick = async () => {
+    const nid = selectedNodeId;
+    if (!nid) return;
+    rpYes.disabled = true; rpNo.disabled = true;
+    rpStatus.textContent = 'removing…'; rpStatus.className = 'term-status';
+    try {
+      const r = await fetch('/api/peers/' + nid, { method: 'DELETE' });
+      const body = await r.json().catch(() => ({}));
+      if (r.ok && body.ok) {
+        rpConfirm.style.display = 'none';
+        rpStatus.textContent = 'removed ✓'; rpStatus.className = 'term-status connected';
+        closeTerminal();
+        selectedNodeId = null;
+        localStorage.removeItem(SELECT_KEY);
+        pollOnce();
+      } else {
+        rpStatus.textContent = body.error || ('error ' + r.status);
+        rpStatus.className = 'term-status';
+      }
+    } catch (e) {
+      rpStatus.textContent = 'request failed: ' + (e && e.message ? e.message : e);
+      rpStatus.className = 'term-status';
+    } finally {
+      rpYes.disabled = false; rpNo.disabled = false;
+    }
+  };
+
   // ── Renderers ───────────────────────────────────────────────────────
   // Global status bar: the "is everything ok?" layer. One dot + word, the
   // up/down/maint tally, and the single worst-uptime node — all derived from
@@ -1114,6 +1217,12 @@ footer.foot {
     detailStatus.className = 'status-pill ' + (node.in_maint ? 'maint' : status);
     detailStatus.textContent = node.in_maint ? 'MAINT' : status;
     setText(detailRole, node.is_local ? 'this node' : (node.tags || 'peer'));
+
+    // Remove-peer card: only meaningful for peers (you can't revoke yourself).
+    // Only reset the confirm state when the selection actually changes — not on
+    // every poll repaint, else an open "are you sure?" prompt would snap shut.
+    rpCard.style.display = node.is_local ? 'none' : 'block';
+    if (rpLastNid !== nid) { rpLastNid = nid; resetRemoveUI(); }
 
     // Multi-window uptime. For the local node we don't probe ourselves, so the
     // windows read "live" rather than a misleading percentage.
@@ -1446,6 +1555,90 @@ footer.foot {
   refreshBtn.onclick = pollOnce;
   procSort.onchange = () => { localStorage.setItem(PROC_SORT_KEY, procSort.value); if (selectedNodeId) paintDetails(); };
   procLimit.onchange = () => { localStorage.setItem(PROC_LIMIT_KEY, procLimit.value); if (selectedNodeId) paintDetails(); };
+
+  // ── Copy own node id ─────────────────────────────────────────────────
+  async function copyNodeId() {
+    if (!ownNodeId) return;
+    let ok = false;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(ownNodeId);
+        ok = true;
+      }
+    } catch (e) { ok = false; }
+    if (!ok) {
+      // Fallback for non-secure contexts.
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = ownNodeId; ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta); ta.select();
+        ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+      } catch (e) { ok = false; }
+    }
+    if (ok && nodeCopy) {
+      const prev = nodeCopy.textContent;
+      nodeCopy.textContent = 'copied!';
+      setTimeout(() => { nodeCopy.textContent = prev; }, 1200);
+    }
+  }
+  if (nodeCopy) nodeCopy.onclick = copyNodeId;
+  if (nodeVal) nodeVal.onclick = copyNodeId;
+
+  // ── Add peer ─────────────────────────────────────────────────────────
+  const apNodeId = $('ap-nodeid');
+  const apAlias = $('ap-alias');
+  const apMonitor = $('ap-monitor');
+  const apDash = $('ap-dash');
+  const apShell = $('ap-shell');
+  const apSubmit = $('ap-submit');
+  const apMsg = $('ap-msg');
+
+  function setApMsg(text, kind) {
+    if (!apMsg) return;
+    apMsg.textContent = text || '';
+    apMsg.className = 'ap-msg' + (kind ? ' ' + kind : '');
+  }
+
+  async function submitAddPeer() {
+    const nid = (apNodeId.value || '').trim().toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(nid)) {
+      setApMsg('node id must be 64 hex chars', 'error');
+      return;
+    }
+    const perms = [];
+    if (apMonitor.checked) perms.push('monitor');
+    if (apDash.checked) perms.push('view_dashboard');
+    if (apShell.checked) perms.push('shell');
+    if (!perms.length) { setApMsg('select at least one permission', 'error'); return; }
+
+    apSubmit.disabled = true;
+    setApMsg('adding…', '');
+    try {
+      const r = await fetch('/api/peers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ node_id: nid, alias: (apAlias.value || '').trim(), permissions: perms }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (r.ok && body.ok) {
+        setApMsg('added ✓', 'ok');
+        apNodeId.value = ''; apAlias.value = '';
+        apDash.checked = false; apShell.checked = false; apMonitor.checked = true;
+        pollOnce();
+        setTimeout(() => setApMsg('', ''), 2500);
+      } else {
+        setApMsg(body.error || ('error ' + r.status), 'error');
+      }
+    } catch (e) {
+      setApMsg('request failed: ' + (e && e.message ? e.message : e), 'error');
+    } finally {
+      apSubmit.disabled = false;
+    }
+  }
+  if (apSubmit) apSubmit.onclick = submitAddPeer;
+  if (apNodeId) apNodeId.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitAddPeer(); });
+  if (apAlias) apAlias.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitAddPeer(); });
 
   pollOnce();
   schedulePolling();
@@ -1859,6 +2052,31 @@ class WebApp:
         @self._app.route("/api/dashboard")
         def api_dashboard():
             return jsonify(self._build_dashboard())
+
+        @self._app.route("/api/peers", methods=["POST"])
+        def api_add_peer():
+            data = request.get_json(silent=True) or {}
+            node_id = (data.get("node_id") or "").strip().lower()
+            alias = (data.get("alias") or "").strip() or None
+            perms = data.get("permissions") or ["monitor"]
+            if not isinstance(perms, list):
+                return jsonify({"error": "permissions must be a list"}), 400
+            # engine.add_peer validates hex/self/PublicKey + perms and returns a
+            # clean error string, or None on success (peer is live immediately).
+            err = engine.add_peer(node_id, alias, perms, tags=None)
+            if err:
+                return jsonify({"error": err}), 400
+            return jsonify({"ok": True})
+
+        @self._app.route("/api/peers/<nid>", methods=["DELETE"])
+        def api_remove_peer(nid):
+            nid = (nid or "").strip().lower()
+            # engine.revoke_peer validates the id and appends the signed
+            # revoke op, then reloads devices so it takes effect immediately.
+            err = engine.revoke_peer(nid)
+            if err:
+                return jsonify({"error": err}), 400
+            return jsonify({"ok": True})
 
         @self._app.route("/incidents/<nid>")
         def incidents_page(nid):
