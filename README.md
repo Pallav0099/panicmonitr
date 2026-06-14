@@ -36,16 +36,53 @@ an append-only, cryptographically signed log per node.
 
 ---
 
-## Quick start
+## Install
 
-Run on **both** machines:
+### Easy install (recommended)
+
+No Python, no virtualenv, no building anything. One command downloads a
+ready-to-run program for your computer and sets it up:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Pallav0099/panicmonitr/main/install.sh | sh
+```
+
+That's the whole install. It figures out which build your machine needs,
+downloads it, checks it wasn't tampered with, and adds the `panic-monitor`
+command. Works on **Linux** -- both regular PCs/servers (`x86_64`) and ARM
+boards like the Raspberry Pi (`aarch64`), on any reasonably modern system
+(Debian 12+, Ubuntu 22.04+, Fedora 36+, or newer).
+
+- **Want it available for every user on the machine?** Run it with `sudo`:
+  ```sh
+  curl -fsSL https://raw.githubusercontent.com/Pallav0099/panicmonitr/main/install.sh | sudo sh
+  ```
+- **Prefer to read a script before running it?** (Good instinct.) Download
+  [`install.sh`](install.sh), open it in a text editor, then run `sh install.sh`.
+- **See `panic-monitor: command not found` afterwards?** It installed to
+  `~/.local/bin`, which isn't on your `PATH` yet. Fix it once:
+  ```sh
+  echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+  ```
+
+### From source (developers)
+
+Needs **Python 3.12+**. The binary above bundles its own interpreter, so this
+path is only for hacking on the code:
 
 ```fish
-# Install
-git clone <repo-url> panic-monitr && cd panic-monitr
-python3 -m venv .venv && source .venv/bin/activate.fish   # or .venv/bin/activate
+git clone https://github.com/Pallav0099/panicmonitr.git && cd panicmonitr
+python3 -m venv .venv && source .venv/bin/activate   # fish: .venv/bin/activate.fish
 pip install -e .
+```
 
+---
+
+## Quick start
+
+Once it's installed, run this on **both** machines:
+
+```fish
 # Init + start
 panic-monitor --init              # generates signing identity, prompts for password
 panic-monitor --install-service   # wires up systemd, encrypts password, starts daemon
@@ -70,7 +107,7 @@ No further password prompts, no restarts.
 ## Prerequisites
 
 - **Linux** with systemd >= 250 (system mode) or >= 256 (user mode with `systemd-creds`)
-- **Python 3.12+**
+- **Python 3.12+** -- only for the *from source* install; the prebuilt binary bundles its own
 - **Docker** (optional -- pass `--no-docker` to skip container stats)
 - TPM2 is nice-to-have; `systemd-creds` falls back to per-user host key
 
