@@ -91,7 +91,7 @@ _COMMAND_DESTS = (
     "add_peer", "remove_peer", "revoke_peer", "list_peers",
     "set_permissions", "add_permission", "set_tags", "add_tag", "remove_tag",
     "set_maintenance", "clear_maintenance", "list_maintenance",
-    "uptime", "history", "test_webhook", "fetch_dashboard", "dashboard_url",
+    "uptime", "history", "test_webhook", "fetch_dashboard",
     "daemon", "tui",
     "install_service", "uninstall_service", "migrate", "rotate_credential",
     "selftest",
@@ -142,7 +142,6 @@ def parse_args() -> argparse.Namespace:
     g_query.add_argument("--history", type=str, metavar="TARGET", help="Dump recent latency history for a peer")
     g_query.add_argument("--test-webhook", action="store_true", help="Fire a test notification to --webhook-url and exit")
     g_query.add_argument("--fetch-dashboard", type=str, metavar="TARGET", help="Pull a sibling peer's dashboard over the status ALPN (requires view_dashboard permission from them)")
-    g_query.add_argument("--dashboard-url", action="store_true", help="Print the tokenized local dashboard URL (reads the runtime token file written by the daemon)")
 
     g_run = parser.add_argument_group("run commands")
     g_run.add_argument("--daemon", action="store_true", help="Run headless daemon")
@@ -517,6 +516,18 @@ def _run_selftest() -> None:
             print("selftest FAILED: machine-id crypto round-trip mismatch", file=sys.stderr)
             sys.exit(1)
 
+    # Exercise the dashboard session-key derivation (BLAKE2b over the seed) —
+    # a new startup path as of v0.1.2; must be deterministic for the same seed.
+    import nacl.encoding as _nenc
+    import nacl.hash as _nhash
+
+    _seed = b"\x00" * 32
+    _d1 = _nhash.blake2b(_seed, digest_size=32, person=b"pm-dash-session", encoder=_nenc.RawEncoder)
+    _d2 = _nhash.blake2b(_seed, digest_size=32, person=b"pm-dash-session", encoder=_nenc.RawEncoder)
+    if _d1 != _d2 or len(_d1) != 32:
+        print("selftest FAILED: dashboard session-key derivation unstable", file=sys.stderr)
+        sys.exit(1)
+
     print("selftest OK")
     sys.exit(0)
 
@@ -631,20 +642,6 @@ def cli_main() -> None:
             print(f"Reset failed: {exc}")
             sys.exit(1)
         print(f"Password updated. Node ID unchanged: {meta.node_id}")
-        return
-
-    # --- Dashboard URL (read-only, no password) ---------------------------
-    if args.dashboard_url:
-        configure_logging(debug=args.debug)
-        url_path = paths.default_dashboard_url_path()
-        if not url_path.exists():
-            print(
-                "No dashboard token found -- is the daemon running with the dashboard "
-                "enabled (--dashboard-port != 0)?",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        print(url_path.read_text().strip())
         return
 
     # --- Show identity (read-only, no password) ---------------------------

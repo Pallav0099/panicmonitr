@@ -2531,6 +2531,28 @@ class MonitorEngine:
         except (ValueError, FileNotFoundError):
             return False
 
+    def dashboard_session_secret(self) -> bytes:
+        """Derive a stable Flask session-signing key from the identity seed.
+
+        The dashboard's login sessions are signed with this key. Deriving it
+        from the seed (rather than a fresh random value each start) is the whole
+        UX win over the old per-startup token: a ``systemctl restart`` keeps the
+        same key, so an already-logged-in browser tab stays authenticated across
+        daemon restarts and upgrades. It rotates only if the node identity does.
+
+        Domain-separated via BLAKE2b personalization so this value can never
+        collide with any other use of the seed (signing keys, peer auth, etc.).
+        """
+        import nacl.encoding
+        import nacl.hash
+
+        return nacl.hash.blake2b(
+            self._secret_key,
+            digest_size=32,
+            person=b"pm-dash-session",
+            encoder=nacl.encoding.RawEncoder,
+        )
+
     def add_peer(
         self,
         node_id: str,

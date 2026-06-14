@@ -31,6 +31,9 @@ class _FakeRole:
     value = "both"
 
 
+_TEST_PASSWORD = "correct-horse-battery-staple"
+
+
 class _FakeEngine:
     node_id = "a" * 64
     role = _FakeRole()
@@ -42,6 +45,13 @@ class _FakeEngine:
 
     def get_device_states(self):
         return []
+
+    def verify_identity_password(self, password):
+        return password == _TEST_PASSWORD
+
+    def dashboard_session_secret(self):
+        # Stable (seed-derived in the real engine) so sessions survive restarts.
+        return b"\x11" * 32
 
     @property
     def history(self):
@@ -144,15 +154,17 @@ class MiscRegressionTests(unittest.TestCase):
             app.start()
         try:
             client = app._app.test_client()
-            # The dashboard is token-gated; authenticate so we reach the route's
-            # own id validation rather than the auth guard.
-            hdrs = {"X-Panic-Token": app._token}
-            local = client.get("/api/container/bad;id/logs", headers=hdrs)
-            peer = client.get(f"/api/node/{'b' * 64}/container/bad;id/logs", headers=hdrs)
+            # The dashboard is login-gated; authenticate so we reach the route's
+            # own id validation rather than the auth guard. The test client
+            # persists the session cookie set by /login.
+            client.post("/login", data={"password": _TEST_PASSWORD})
+            local = client.get("/api/container/bad;id/logs")
+            peer = client.get(f"/api/node/{'b' * 64}/container/bad;id/logs")
             self.assertEqual(local.status_code, 400)
             self.assertEqual(peer.status_code, 400)
-            # And without the token, the guard rejects before the route.
-            self.assertEqual(client.get("/api/container/bad;id/logs").status_code, 401)
+            # And without a session, the guard rejects before the route.
+            anon = app._app.test_client()
+            self.assertEqual(anon.get("/api/container/bad;id/logs").status_code, 401)
         finally:
             app.stop()
 
@@ -160,3 +172,86 @@ class MiscRegressionTests(unittest.TestCase):
         self.assertIn("new AbortController()", _HTML)
         self.assertIn("state.token !== token", _HTML)
         self.assertIn("getNodeId(d)", _HTML)
+
+
+class _NullServer:
+    def serve_forever(self):
+        return None
+
+    def shutdown(self):
+        return None
+
+
+class WebAuthTests(unittest.TestCase):
+    """The :42069 control plane is gated by an identity-password login."""
+
+    def _make_app(self) -> WebApp:
+        app = WebApp(_FakeEngine(), port=42069)
+        with mock.patch("werkzeug.serving.make_server", return_value=_NullServer()):
+            app.start()
+        return app
+
+    def test_unauthed_page_redirects_to_login(self) -> None:
+        app = self._make_app()
+        try:
+            r = app._app.test_client().get("/")
+            self.assertEqual(r.status_code, 302)
+            self.assertIn("/login", r.headers.get("Location", ""))
+        finally:
+            app.stop()
+
+    def test_unauthed_api_returns_401(self) -> None:
+        app = self._make_app()
+        try:
+            self.assertEqual(app._app.test_client().get("/api/dashboard").status_code, 401)
+        finally:
+            app.stop()
+
+    def test_wrong_password_rejected_and_grants_no_session(self) -> None:
+        app = self._make_app()
+        try:
+            client = app._app.test_client()
+            r = client.post("/login", data={"password": "nope"})
+            self.assertEqual(r.status_code, 401)
+            # Still no session: the API stays locked.
+            self.assertEqual(client.get("/api/dashboard").status_code, 401)
+        finally:
+            app.stop()
+
+    def test_correct_password_opens_session(self) -> None:
+        app = self._make_app()
+        try:
+            client = app._app.test_client()
+            r = client.post("/login", data={"password": _TEST_PASSWORD})
+            self.assertEqual(r.status_code, 302)
+            self.assertEqual(client.get("/api/dashboard").status_code, 200)
+            # Logout clears it again.
+            client.get("/logout")
+            self.assertEqual(client.get("/api/dashboard").status_code, 401)
+        finally:
+            app.stop()
+
+    def test_foreign_origin_blocked(self) -> None:
+        app = self._make_app()
+        try:
+            client = app._app.test_client()
+            client.post("/login", data={"password": _TEST_PASSWORD})
+            r = client.get("/api/dashboard", headers={"Origin": "http://evil.example"})
+            self.assertEqual(r.status_code, 403)
+        finally:
+            app.stop()
+
+    def test_session_secret_is_stable_across_restarts(self) -> None:
+        # Same engine (same seed) → same Flask secret_key, so an existing cookie
+        # stays valid after a daemon restart. This is the headline UX win over
+        # the old per-startup token.
+        engine = _FakeEngine()
+        a, b = WebApp(engine, port=42069), WebApp(engine, port=42069)
+        with mock.patch("werkzeug.serving.make_server", return_value=_NullServer()):
+            a.start()
+            b.start()
+        try:
+            self.assertEqual(a._app.secret_key, b._app.secret_key)
+        finally:
+            a.stop()
+            b.stop()

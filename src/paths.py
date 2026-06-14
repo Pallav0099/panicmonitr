@@ -84,8 +84,6 @@ CONTROL_SOCKET_NAME = "control.sock"
 # machine-id password backend: SecretBox ciphertext + its argon2 salt
 PASSWORD_ENC_NAME = "password.enc"
 PASSWORD_SALT_NAME = "password.salt"
-# Tokenized dashboard URL, written 0600 by the daemon for `--dashboard-url`.
-DASHBOARD_URL_NAME = "dashboard.url"
 
 
 def default_identity_path() -> Path:
@@ -114,7 +112,3 @@ def default_logstore_path() -> Path:
 
 def default_control_socket() -> Path:
     return runtime_dir() / CONTROL_SOCKET_NAME
-
-
-def default_dashboard_url_path() -> Path:
-    return runtime_dir() / DASHBOARD_URL_NAME

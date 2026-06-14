@@ -22,7 +22,7 @@ mesh over [Iroh](https://iroh.computer/) QUIC connections, and access control is
 an append-only, cryptographically signed log per node.
 
 - **Heartbeat probing** with configurable thresholds, flap suppression, and webhook alerts
-- **At-a-glance dashboard** at `http://127.0.0.1:42069/` -- global status bar, monitor sidebar, multi-window uptime (24h/7d/30d), heartbeat history, latency sparkline, and an incident log
+- **Two web surfaces** -- a login-gated **control dashboard** on `:42069` (full interactive UI: global status bar, monitor sidebar, multi-window uptime (24h/7d/30d), heartbeat history, latency sparkline, incident log, peer/permission/shell controls) and a no-auth **read-only status page** on `:8080` (`/status.json` for uptime checkers). See [Dashboard](#dashboard).
 - **System stats** -- CPU, memory, disk, load, temperature, top-N processes
 - **Docker diagnostics** -- per-container CPU/MEM/net/block-IO, ports, mounts, health, logs
 - **Cross-device stats** -- pull live stats from peers over iroh QUIC, delta-synced
@@ -76,6 +76,24 @@ python3 -m venv .venv && source .venv/bin/activate   # fish: .venv/bin/activate.
 pip install -e .
 ```
 
+### Upgrading
+
+Re-run the same one-liner -- it overwrites the binary in place and, if a
+`panic-monitor` service is enabled, **restarts it** so the new version takes
+effect immediately:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Pallav0099/panicmonitr/main/install.sh | sh
+```
+
+Your state -- identity (`secret.key`/`secret.meta`), trust log, peer cache, and
+history DBs -- lives in your config/data dirs and is **never touched** by an
+upgrade; your stored password backend is preserved too. If you re-render the
+systemd unit (`panic-monitor --install-service --force`), that now restarts an
+already-running daemon as well (older versions left the running process on the
+old binary). Dashboard logins survive the restart, so any open tab stays signed
+in.
+
 ---
 
 ## Quick start
@@ -94,9 +112,10 @@ panic-monitor --show-identity     # prints 64-char hex Node ID -- share it
 panic-monitor --add-peer <THEIR_NODE_ID> --alias "my-server" --permissions monitor
 ```
 
-Open `http://127.0.0.1:42069/`. After both sides add each other, the peer
-appears in the fleet view within one probe interval (30s default). Click any
-card to see live CPU, memory, disk, processes, and containers.
+Open `http://127.0.0.1:42069/` and sign in with your identity password. After
+both sides add each other, the peer appears in the fleet view within one probe
+interval (30s default). Click any card to see live CPU, memory, disk, processes,
+and containers.
 
 After `--install-service`, admin commands talk to the running daemon over the
 control socket -- no restarts. Read-only commands (`--list-peers`, `--uptime`,
@@ -200,10 +219,10 @@ authenticated RCE into that node, so it is **strictly default-deny**:
   permission. It is **not** implied by `monitor` or `view_dashboard` (no
   fallback). The `*` wildcard *does* grant it -- avoid `*` if you don't want
   shell exposure.
-- The dashboard at `:42069` is loopback-only and **token-gated** (see
-  [Dashboard](#dashboard)): opening a shell requires the dashboard token, and
-  the WebSocket is rejected from foreign browser origins. Adding peers /
-  changing permissions additionally requires your identity password.
+- The dashboard at `:42069` is loopback-only and **login-gated** (see
+  [Dashboard](#dashboard)): opening a shell requires an authenticated dashboard
+  session (you sign in with your identity password), and the WebSocket is
+  rejected from foreign browser origins.
 - Every session is recorded as a signed, tamper-evident `shell_open` /
   `shell_close` op in the **host's** trust log (`log.jsonl`).
 - Under system-mode systemd the spawned shell inherits the unit's sandbox
@@ -235,10 +254,11 @@ Three surfaces, three layers of authentication:
   for one -- identity comes from the connection, never the request payload.
 - **Control socket (CLI ↔ daemon):** a `0600` Unix socket, with every request
   checked via `SO_PEERCRED` so only the daemon's own user can drive it.
-- **Dashboard (`:42069`):** loopback-only, gated by a per-startup token plus an
-  `Origin`/`Host` allowlist (blocks browser CSRF / DNS-rebinding). The sensitive
-  trust mutations -- adding a peer, changing permissions -- additionally require
-  your identity password.
+- **Dashboard (`:42069`):** loopback-only, behind a **login page** -- you sign in
+  with your identity password and get a signed, `HttpOnly`, `SameSite=Strict`
+  session cookie, on top of an `Origin`/`Host` allowlist (blocks browser CSRF /
+  DNS-rebinding). The session key is derived from the node seed, so logins
+  survive a daemon restart. The read-only status page on `:8080` stays open.
 - **Remote shell** is a dedicated `shell` grant, never implied by `monitor`, and
   every session is a signed `shell_open`/`shell_close` entry in the trust log.
 
@@ -258,30 +278,44 @@ Three surfaces, three layers of authentication:
 
 ## Dashboard
 
-Two HTTP surfaces, both bound to loopback:
+The daemon serves **two HTTP surfaces, both bound to `127.0.0.1`**, with
+deliberately different jobs:
 
-| Port | Source | Auth | Purpose |
+| Port | Plane | Auth | What it's for |
 |---|---|---|---|
-| 42069 | Flask + Plotly | **token + Origin allowlist** | Live SPA dashboard -- polls `/api/dashboard` |
-| 8080 | stdlib `http.server` | none (read-only) | Lightweight status page + `/status.json` |
+| **`:42069`** | **Control plane** (Flask + Plotly) | **login** + Origin/Host allowlist | The full interactive dashboard. Live per-node CPU/mem/disk/process/container detail, heartbeat + latency + incident history, **and every mutation**: add/revoke peers, change permissions, open PTY shells. Read **and** write. |
+| **`:8080`** | **Viewing plane** (stdlib `http.server`) | none (read-only) | A lightweight at-a-glance status page plus a machine-readable `/status.json`. Strictly read-only -- no controls, no shell, nothing to authenticate. Safe to point a status board or uptime checker at. |
 
-The dashboard requires a per-startup **token**. The daemon prints the tokenized
-URL on startup; retrieve it any time with:
+In short: **`:42069` is where you *operate* the mesh, `:8080` is where you (or a
+script) just *look* at it.** The control plane can do everything the viewing
+plane shows, so if you only need to glance at status, `:8080` is the surface to
+use — and the only one meant to be scraped.
+
+- **`:42069`** is configured with `--dashboard-port` (set `0` to disable it).
+- **`:8080`** is configured with `--status-bind` (e.g. `--status-bind ""` to
+  disable, or `--status-bind 127.0.0.1:9000` to move it).
+
+### Control plane (`:42069`)
+
+The control dashboard is behind a **login page**. Just open it and sign in:
 
 ```fish
-panic-monitor --dashboard-url        # -> http://127.0.0.1:42069/?t=…
+xdg-open http://127.0.0.1:42069/     # then enter your identity password
 ```
 
-Open that URL; the page strips the token from the address bar and replays it on
-API calls. Trusting a peer or changing permissions from the UI additionally
-prompts for your **identity password**.
+The login sets a signed session cookie (`HttpOnly`, `SameSite=Strict`). The key
+that signs it is derived from the node's seed, so the session **survives a
+daemon restart or upgrade** -- no re-fetching a URL, no token to paste. Once
+signed in, trusting a peer, changing permissions, and opening a shell all work
+without a further prompt; `[Logout]` (top-right) ends the session. For
+read-only viewing without logging in, use the `:8080` status page.
 
 > **Never reverse-proxy `:42069` to a public interface without your own auth
-> layer in front.** The token is designed for same-host use; a proxy that
+> layer in front.** The login is designed for same-host use; a proxy that
 > rewrites `Host`/`Origin` defeats the allowlist, and anyone who reaches the
-> port and obtains the token gets full dashboard access -- including PTY shells
-> into peers that granted you `shell`. Keep it on `127.0.0.1`; tunnel over SSH
-> or a mesh VPN (which bring their own auth) if you need it remotely.
+> port gets full dashboard access -- including PTY shells into peers that
+> granted you `shell`. Keep it on `127.0.0.1`; tunnel over SSH or a mesh VPN
+> (which bring their own auth) if you need it remotely.
 
 The main dashboard at `:42069` renders once and polls JSON. Scroll position,
 expanded containers, and hover state survive every refresh. The layout is built
@@ -305,10 +339,26 @@ Open any node to read its whole system -- live, straight off the peer:
 
 See [docs/dashboard.md](docs/dashboard.md) for the full UI reference.
 
+### Viewing plane (`:8080`)
+
+A tiny, dependency-free status page served by the stdlib HTTP server — the
+"is everything up?" glance with **no login**. It exposes:
+
+- `GET /` — a compact HTML status page (fleet roll-up + per-node up/down).
+- `GET /status.json` — the same data as JSON, for an uptime checker, a wall
+  display, or your own status board.
+- `GET /history.json?node_id=<id>&hours=<n>` — a peer's recent probe history
+  (RTT + status), capped at 30 days.
+
+It is **read-only by design**: there are no mutation routes, no shell, and
+nothing to authenticate, so it's the surface to scrape or (cautiously) expose.
+It still binds to `127.0.0.1` by default — `--status-bind 0.0.0.0:8080` opens it
+to the network, and since it carries no auth, only do that on a trusted LAN.
+
 ```fish
-panic-monitor --daemon --dashboard-port 0    # disable Flask dashboard
-panic-monitor --daemon --status-bind ""      # disable status page
-panic-monitor --daemon --status-bind "0.0.0.0:8080"  # expose (no auth!)
+panic-monitor --daemon --dashboard-port 0            # disable :42069 control plane
+panic-monitor --daemon --status-bind ""              # disable :8080 status page
+panic-monitor --daemon --status-bind "0.0.0.0:8080"  # expose :8080 (no auth!)
 ```
 
 ---
@@ -345,7 +395,6 @@ User mode (default):
 
 $XDG_RUNTIME_DIR/panic-monitor/
     control.sock     daemon <-> CLI IPC (0600, owner-only)
-    dashboard.url    tokenized dashboard URL for --dashboard-url (0600)
 ```
 
 Only one of `password.cred` / `password.enc`+`password.salt` exists, depending
@@ -414,7 +463,6 @@ panic-monitor --help
 | `--uptime TARGET [--window 24h]` | Uptime % over window |
 | `--history TARGET [--hours 24]` | Raw probe stream |
 | `--fetch-dashboard TARGET` | Pull peer's dashboard once |
-| `--dashboard-url` | Print the tokenized local dashboard URL |
 | **Tuning** | |
 | `--role {monitored,monitoring,both}` | Node behavior (default: both) |
 | `--interval SECS` | Heartbeat probe interval (default: 30) |
@@ -460,9 +508,10 @@ per-service). Fix: `panic-monitor --install-service --force`
 **Dashboard `Connection refused` on 42069** -- daemon not running or webapp
 failed to bind. Check: `systemctl --user is-active panic-monitor.service`
 
-**Dashboard loads but stays empty / browser console shows `401`** -- you opened
-`:42069` without the auth token. Get the tokenized URL and open that:
-`panic-monitor --dashboard-url`
+**Dashboard redirects to `/login` / API shows `401`** -- you're not signed in.
+Open `http://127.0.0.1:42069/` and enter your identity password. A `403 forbidden
+origin/host` instead means you reached it through a proxy that rewrote
+`Host`/`Origin` -- browse it directly on `127.0.0.1` (or over an SSH tunnel).
 
 **Peer alive but no stats** -- the remote hasn't granted you `monitor` or
 `view_dashboard`. Both sides need `--add-peer` with at least `monitor`.

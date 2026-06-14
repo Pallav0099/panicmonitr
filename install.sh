@@ -74,11 +74,42 @@ else
 fi
 
 mkdir -p "$BINDIR" || err "cannot create ${BINDIR}"
+
+# Detect an existing install at the target path so we can report (and restart)
+# an upgrade rather than a fresh install.
+UPGRADE=0
+[ -e "${BINDIR}/panic-monitor" ] && UPGRADE=1
+
 install -m755 "${TMP}/${ASSET}" "${BINDIR}/panic-monitor" \
   || err "cannot install to ${BINDIR}; re-run with sudo, or set PANIC_MONITOR_BINDIR to a writable dir."
 
 info ""
-info "Installed panic-monitor -> ${BINDIR}/panic-monitor"
+if [ "$UPGRADE" = "1" ]; then
+  info "Updated panic-monitor -> ${BINDIR}/panic-monitor"
+else
+  info "Installed panic-monitor -> ${BINDIR}/panic-monitor"
+fi
+
+# --- restart an already-running service so the new binary takes effect ------
+# The systemd unit's ExecStart points at the binary path, which is unchanged,
+# so a plain restart picks up the new version. Best-effort and quiet: only acts
+# when the unit is actually enabled, never fails the install.
+restart_service() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  # User unit (the default install mode) — only if it's actually running.
+  if systemctl --user is-active panic-monitor.service >/dev/null 2>&1; then
+    info "Restarting user service to apply the update..."
+    systemctl --user restart panic-monitor.service \
+      || info "  (restart failed — run: systemctl --user restart panic-monitor)"
+  fi
+  # System unit (only when we can manage it).
+  if [ "$(id -u)" = "0" ] && systemctl is-active panic-monitor.service >/dev/null 2>&1; then
+    info "Restarting system service to apply the update..."
+    systemctl restart panic-monitor.service \
+      || info "  (restart failed — run: sudo systemctl restart panic-monitor)"
+  fi
+}
+[ "$UPGRADE" = "1" ] && restart_service
 
 # --- PATH hint -------------------------------------------------------------
 case ":${PATH}:" in
@@ -90,6 +121,13 @@ case ":${PATH}:" in
 esac
 
 info ""
-info "Next steps:"
-info "  panic-monitor --init              # create your cryptographic identity"
-info "  panic-monitor --install-service   # run it as a background service"
+if [ "$UPGRADE" = "1" ]; then
+  info "Upgrade complete. State (identity, trust log, history) is preserved in your"
+  info "config/data dirs and was not touched. If the service was running it has been"
+  info "restarted; otherwise apply the new binary with:"
+  info "  systemctl --user restart panic-monitor   # (or: sudo systemctl restart panic-monitor)"
+else
+  info "Next steps:"
+  info "  panic-monitor --init              # create your cryptographic identity"
+  info "  panic-monitor --install-service   # run it as a background service"
+fi

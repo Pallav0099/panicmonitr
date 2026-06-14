@@ -27,7 +27,15 @@ if TYPE_CHECKING:
     from src.engine import MonitorEngine
 
 try:
-    from flask import Flask, jsonify, render_template_string, request
+    from flask import (
+        Flask,
+        jsonify,
+        redirect,
+        render_template_string,
+        request,
+        session,
+        url_for,
+    )
     _FLASK_OK = True
 except ImportError:
     _FLASK_OK = False
@@ -563,6 +571,7 @@ footer.foot {
           <option value="0">paused</option>
         </select>
         <button class="btn" id="refresh-now">[Refresh]</button>
+        <a class="btn" href="/logout" title="end this dashboard session">[Logout]</a>
       </div>
     </div>
   </div>
@@ -752,19 +761,19 @@ footer.foot {
 (function () {
   'use strict';
 
-  // ── Auth token ──────────────────────────────────────────────────────
-  // The daemon prints a URL like http://127.0.0.1:42069/?t=… — read it once,
-  // strip it from the address bar, and replay it as a header on API calls
-  // (and as ?t= on the shell WebSocket / incident links).
-  const TOKEN = new URLSearchParams(location.search).get('t') || '';
-  if (TOKEN) { try { history.replaceState(null, '', location.pathname); } catch (e) {} }
-  const TOKEN_Q = TOKEN ? ('?t=' + encodeURIComponent(TOKEN)) : '';
+  // ── Auth ────────────────────────────────────────────────────────────
+  // The dashboard sits behind a login page (POST /login with the identity
+  // password). Auth is a signed, HttpOnly, SameSite=Strict session cookie that
+  // the browser attaches to every same-origin request automatically — including
+  // the shell WebSocket handshake — so there is no token to carry in URLs. A
+  // 401 mid-session means the cookie expired or the daemon's identity changed;
+  // bounce to the login page.
   function authFetch(url, opts) {
     opts = opts || {};
-    const h = new Headers(opts.headers || {});
-    if (TOKEN) h.set('X-Panic-Token', TOKEN);
-    opts.headers = h;
-    return fetch(url, opts);
+    return fetch(url, opts).then((r) => {
+      if (r.status === 401) { location.href = '/login'; }
+      return r;
+    });
   }
 
   // ── State ───────────────────────────────────────────────────────────
@@ -969,7 +978,7 @@ footer.foot {
     termState.fit = fit;
 
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(proto + '://' + location.host + '/api/node/' + nid + '/shell' + TOKEN_Q);
+    const ws = new WebSocket(proto + '://' + location.host + '/api/node/' + nid + '/shell');
     ws.binaryType = 'arraybuffer';
     termState.ws = ws;
     const enc = new TextEncoder();
@@ -1216,7 +1225,7 @@ footer.foot {
     incEmpty.style.display = 'none';
     // The card only holds the recent slice; the full, unscrolled history lives
     // on a dedicated page so you can read days of incidents without scrubbing.
-    incViewAll.href = '/incidents/' + encodeURIComponent(getNodeId(node)) + TOKEN_Q;
+    incViewAll.href = '/incidents/' + encodeURIComponent(getNodeId(node));
     incViewAll.style.display = 'block';
     incList.innerHTML = list.map(inc => {
       const start = new Date(inc.started);
@@ -1664,17 +1673,15 @@ footer.foot {
     if (apShell.checked) perms.push('shell');
     if (!perms.length) { setApMsg('select at least one permission', 'error'); return; }
 
-    // Trusting a new peer is a sensitive change — require the identity password.
-    const pw = window.prompt('Enter your identity password to authorize adding this peer:');
-    if (pw === null || pw === '') { setApMsg('cancelled', ''); return; }
-
+    // Trusting a new peer is a sensitive change, but the dashboard login (an
+    // authed session) is already proof of the identity password — no re-prompt.
     apSubmit.disabled = true;
     setApMsg('adding…', '');
     try {
       const r = await authFetch('/api/peers', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ node_id: nid, alias: (apAlias.value || '').trim(), permissions: perms, password: pw }),
+        body: JSON.stringify({ node_id: nid, alias: (apAlias.value || '').trim(), permissions: perms }),
       });
       const body = await r.json().catch(() => ({}));
       if (r.ok && body.ok) {
@@ -1700,6 +1707,74 @@ footer.foot {
   schedulePolling();
 })();
 </script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Login page — the only unauthenticated route on the control plane (:42069).
+# Posts the identity password; on success the daemon sets a signed session
+# cookie. Deliberately tiny: no polling, no external JS, just the brand banner
+# and one field.
+# ---------------------------------------------------------------------------
+
+_LOGIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>panic-monitor · sign in</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: rgb(12,11,15); --panel: rgb(22,20,28); --panel-strong: rgb(30,27,38);
+  --bright: rgb(242,236,222); --text: rgb(205,195,178); --muted: rgb(148,136,115);
+  --dim: rgb(96,86,70); --faint: rgb(60,53,42);
+  --accent: rgb(220,130,40); --accent-light: rgb(248,168,62); --accent-title: rgb(238,148,52);
+  --red: rgb(224,85,85);
+  --border: rgba(255,240,210,0.08); --border-soft: rgba(255,240,210,0.04);
+  --shadow: 4px 4px 0 rgba(0,0,0,0.55); --glow: 0 0 18px rgba(220,130,40,0.38);
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  background-color: var(--bg);
+  background-image:
+    linear-gradient(rgba(255,240,200,0.038) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,240,200,0.038) 1px, transparent 1px);
+  background-size: 32px 32px;
+  color: var(--text); font-family:'JetBrains Mono',monospace; font-size:13px; line-height:1.55;
+  min-height:100vh; display:flex; align-items:center; justify-content:center; padding:32px 20px;
+}
+::selection { background: var(--accent); color: var(--bright); }
+.wrap { width:100%; max-width:380px; display:flex; flex-direction:column; gap:1rem; }
+.banner { color: var(--accent-title); text-shadow: var(--glow); max-width:320px; width:80%; margin:0 auto 2px; }
+.tagline { text-align:center; font-size:0.62rem; color: var(--muted); letter-spacing:3px; text-transform:uppercase; margin-bottom:8px; }
+.card { border:2px solid var(--border); background: var(--panel); padding:24px 22px 20px; box-shadow: var(--shadow); position:relative; display:flex; flex-direction:column; gap:12px; }
+.card-label { position:absolute; top:-10px; left:16px; background: var(--panel); padding:0 10px; color: var(--accent); font-size:0.65rem; font-weight:600; letter-spacing:2px; text-transform:uppercase; }
+.hint { font-size:0.66rem; color: var(--muted); line-height:1.5; }
+.inp { background: var(--bg); border:1px solid var(--border-soft); color: var(--bright); font-family:inherit; font-size:0.8rem; padding:9px 11px; width:100%; box-sizing:border-box; }
+.inp:focus { outline:none; border-color: var(--accent); }
+.btn { background:transparent; border:1px solid var(--accent); color: var(--accent); font-family:inherit; font-size:0.7rem; font-weight:600; padding:9px 12px; cursor:pointer; letter-spacing:2px; text-transform:uppercase; transition:all 0.15s; }
+.btn:hover { background: var(--accent); color: var(--bg); box-shadow: var(--glow); }
+.err { font-size:0.66rem; color: var(--red); letter-spacing:0.5px; min-height:0.9rem; }
+.foot { text-align:center; font-size:0.6rem; color: var(--faint); letter-spacing:2px; text-transform:uppercase; padding-top:8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="banner">{{ ascii_svg | safe }}</div>
+  <div class="tagline">peer-to-peer health monitor // local-first</div>
+  <form class="card" method="POST" action="/login" autocomplete="off">
+    <div class="card-label">[Sign in]</div>
+    <div class="hint">Enter this node's identity password to access the control dashboard. The read-only status page stays open on <code>:8080</code>.</div>
+    <input class="inp" type="password" name="password" placeholder="identity password" autofocus required>
+    <button class="btn" type="submit">[Unlock]</button>
+    {% if error %}<div class="err">{{ error }}</div>{% endif %}
+  </form>
+  <div class="foot">panic-monitor // control plane // 127.0.0.1</div>
+</div>
 </body>
 </html>
 """
@@ -2089,8 +2164,6 @@ class WebApp:
         # actually drain in-flight handlers before the engine closes its
         # SQLite stores.
         self._server = None
-        self._token: Optional[str] = None      # loopback dashboard auth token
-        self._url_path: Optional[Path] = None  # runtime file holding the tokenized URL
 
     def start(self) -> None:
         if not _FLASK_OK:
@@ -2107,33 +2180,31 @@ class WebApp:
 
         engine = self._engine
 
-        # --- Auth: loopback token + Origin/Host allowlist ------------------
+        # --- Auth: identity-password login + Origin/Host allowlist ---------
         # The dashboard binds to 127.0.0.1, but loopback isn't a security
-        # boundary on its own: a malicious web page can reach it (WS bypasses
-        # CORS preflight) and any local process can connect. So gate it with a
-        # per-startup token (carried in the URL the daemon prints) and reject
-        # foreign-Origin browser requests.
-        import os as _os
+        # boundary on its own: a malicious web page can reach it (a WS handshake
+        # bypasses CORS preflight) and any local process can connect. So gate it
+        # behind a login page (POST /login, identity password) backed by a
+        # signed session cookie, and reject foreign-Origin browser requests.
         import secrets as _secrets
-        from src import paths as _paths
+        import time as _time
 
-        self._token = _secrets.token_urlsafe(32)
-        dash_url = f"http://127.0.0.1:{self._port}/?t={self._token}"
-        try:
-            rt = _paths.ensure_runtime_dir()
-            url_path = rt / _paths.DASHBOARD_URL_NAME
-            fd = _os.open(str(url_path), _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
-            try:
-                _os.write(fd, dash_url.encode())
-            finally:
-                _os.close(fd)
-            _os.chmod(url_path, 0o600)  # in case it pre-existed with looser mode
-            self._url_path = url_path
-        except OSError as exc:
-            logger.warning("[webapp] could not write dashboard url file: {}", exc)
-            self._url_path = None
+        # The session-signing key is derived from the node's seed, so it is
+        # stable across daemon restarts — a logged-in browser tab stays authed
+        # through `systemctl restart`/upgrades (the whole point of replacing the
+        # per-startup token). Falls back to a random key only when the engine
+        # can't derive one (e.g. a stub engine in tests).
+        _secret_fn = getattr(engine, "dashboard_session_secret", None)
+        self._app.secret_key = (
+            _secret_fn() if callable(_secret_fn) else _secrets.token_bytes(32)
+        )
+        self._app.config.update(
+            SESSION_COOKIE_NAME="panic_session",
+            SESSION_COOKIE_HTTPONLY=True,
+            SESSION_COOKIE_SAMESITE="Strict",
+            PERMANENT_SESSION_LIFETIME=timedelta(days=7),
+        )
 
-        _token = self._token
         _allowed_origins = {
             f"http://127.0.0.1:{self._port}",
             f"http://localhost:{self._port}",
@@ -2143,6 +2214,11 @@ class WebApp:
             f"127.0.0.1:{self._port}", f"localhost:{self._port}", f"[::1]:{self._port}",
             "127.0.0.1", "localhost", "[::1]",
         }
+        # In-memory brute-force backstop. verify_identity_password already runs a
+        # slow argon2 unseal per attempt; this just caps sustained guessing.
+        _login_guard = {"fails": 0, "lock_until": 0.0}
+        _LOGIN_MAX_FAILS = 5
+        _LOGIN_LOCK_SECS = 60.0
 
         @self._app.before_request
         def _guard():
@@ -2153,14 +2229,51 @@ class WebApp:
             host = request.headers.get("Host", "")
             if host and host not in _allowed_hosts:
                 return jsonify({"error": "forbidden host"}), 403
-            # (b) Loopback token. Exempt GET / so the SPA can bootstrap: its URL
-            #     carries the token, which it strips and then replays as a header.
-            if request.path == "/" and request.method == "GET":
+            # (b) Session auth. /login is the only unauthenticated surface.
+            if request.path == "/login":
                 return None
-            supplied = request.headers.get("X-Panic-Token") or request.args.get("t", "")
-            if not _secrets.compare_digest(supplied, _token):
+            if session.get("authed"):
+                return None
+            # Unauthenticated: APIs + the shell WS upgrade get a clean 401 (the
+            # SPA bounces to /login on it); page loads redirect to the form.
+            if request.path.startswith("/api/"):
                 return jsonify({"error": "unauthorized"}), 401
-            return None
+            return redirect(url_for("login"))
+
+        @self._app.route("/login", methods=["GET", "POST"])
+        def login():
+            if session.get("authed"):
+                return redirect(url_for("index"))
+            error = None
+            if request.method == "POST":
+                now = _time.monotonic()
+                if _login_guard["lock_until"] > now:
+                    wait = int(_login_guard["lock_until"] - now) + 1
+                    error = f"Too many attempts — wait {wait}s and try again."
+                elif engine.verify_identity_password(request.form.get("password") or ""):
+                    # Fresh session on the privilege transition; seed-derived key
+                    # keeps the cookie valid across restarts.
+                    session.clear()
+                    session["authed"] = True
+                    session.permanent = True
+                    _login_guard["fails"] = 0
+                    _login_guard["lock_until"] = 0.0
+                    return redirect(url_for("index"))
+                else:
+                    _login_guard["fails"] += 1
+                    if _login_guard["fails"] >= _LOGIN_MAX_FAILS:
+                        _login_guard["lock_until"] = now + _LOGIN_LOCK_SECS
+                        _login_guard["fails"] = 0
+                        error = f"Too many attempts — locked for {int(_LOGIN_LOCK_SECS)}s."
+                    else:
+                        error = "Incorrect password."
+            page = render_template_string(_LOGIN_HTML, ascii_svg=_ASCII_SVG, error=error)
+            return (page, 401) if error else page
+
+        @self._app.route("/logout")
+        def logout():
+            session.clear()
+            return redirect(url_for("login"))
 
         @self._app.route("/")
         def index():
@@ -2172,10 +2285,9 @@ class WebApp:
 
         @self._app.route("/api/peers", methods=["POST"])
         def api_add_peer():
+            # An authed session is itself proof of the identity password (set at
+            # login), so this sensitive trust mutation needs no re-prompt.
             data = request.get_json(silent=True) or {}
-            # Sensitive trust mutation — require the identity password.
-            if not engine.verify_identity_password(data.get("password") or ""):
-                return jsonify({"error": "password verification failed"}), 403
             node_id = (data.get("node_id") or "").strip().lower()
             alias = (data.get("alias") or "").strip() or None
             perms = data.get("permissions") or ["monitor"]
@@ -2316,14 +2428,14 @@ class WebApp:
             @self._sock.route("/api/node/<nid>/shell")
             def node_shell(ws, nid):
                 from src.identity import validate_node_id
-                # before_request already enforces Origin+token, but re-check here
-                # (browser WS carries the token as ?t=) so a flask-sock change
-                # can't silently reopen this RCE surface.
+                # before_request already enforces Origin + an authed session, but
+                # re-check here (the session cookie rides the WS handshake) so a
+                # flask-sock change can't silently reopen this RCE surface.
                 origin = request.headers.get("Origin")
                 if origin is not None and origin not in _allowed_origins:
                     ws.close()
                     return
-                if not _secrets.compare_digest(request.args.get("t", ""), _token):
+                if not session.get("authed"):
                     ws.close()
                     return
                 if not validate_node_id(nid):
@@ -2346,7 +2458,11 @@ class WebApp:
             name="webapp",
         )
         self._thread.start()
-        logger.info("[webapp] started — open the dashboard at: {}", dash_url)
+        logger.info(
+            "[webapp] started — open the dashboard at http://127.0.0.1:{} "
+            "(sign in with your identity password)",
+            self._port,
+        )
 
     def stop(self) -> None:
         if self._server is None:
@@ -2358,11 +2474,6 @@ class WebApp:
             logger.debug("[webapp] shutdown error: {}", exc)
         if self._thread is not None:
             self._thread.join(timeout=5)
-        if self._url_path is not None:
-            try:
-                self._url_path.unlink(missing_ok=True)
-            except OSError:
-                pass
         self._server = None
         self._thread = None
 

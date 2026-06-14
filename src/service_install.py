@@ -337,16 +337,29 @@ def install_service(
     unit_path.write_text(content)
     print(f"Wrote {unit_path}")
 
-    # Reload + enable + start ----------------------------------------------
+    # Reload + enable + (re)start ------------------------------------------
+    # Note whether a daemon was already live so we can report install vs upgrade.
+    was_active = (
+        _systemctl("is-active", "--quiet", SERVICE_NAME, system=system).returncode == 0
+    )
     if _systemctl("daemon-reload", system=system).returncode != 0:
         print("daemon-reload failed", file=sys.stderr)
         return 1
-    if _systemctl("enable", "--now", SERVICE_NAME, system=system).returncode != 0:
-        print(f"Failed to enable+start {SERVICE_NAME}", file=sys.stderr)
+    if _systemctl("enable", SERVICE_NAME, system=system).returncode != 0:
+        print(f"Failed to enable {SERVICE_NAME}", file=sys.stderr)
+        return 1
+    # Use `restart`, not `enable --now`: on a re-install over an already-running
+    # daemon, `--now` is a no-op (the unit is already active), so the old binary
+    # and old unit silently stayed live across upgrades. `restart` starts a
+    # stopped service and replaces a running one — so the new version always
+    # takes effect.
+    if _systemctl("restart", SERVICE_NAME, system=system).returncode != 0:
+        print(f"Failed to (re)start {SERVICE_NAME}", file=sys.stderr)
         return 1
 
     mode = "system" if system else "user"
-    print(f"\n{SERVICE_NAME} enabled and started ({mode} mode).")
+    action = "restarted (upgrade)" if was_active else "enabled and started"
+    print(f"\n{SERVICE_NAME} {action} ({mode} mode).")
     print(f"  state config: {config_dir}")
     print(f"  state data:   {data_dir}")
     print(f"  password:     {password_backend}")
