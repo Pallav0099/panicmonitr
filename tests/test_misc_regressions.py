@@ -144,10 +144,15 @@ class MiscRegressionTests(unittest.TestCase):
             app.start()
         try:
             client = app._app.test_client()
-            local = client.get("/api/container/bad;id/logs")
-            peer = client.get(f"/api/node/{'b' * 64}/container/bad;id/logs")
+            # The dashboard is token-gated; authenticate so we reach the route's
+            # own id validation rather than the auth guard.
+            hdrs = {"X-Panic-Token": app._token}
+            local = client.get("/api/container/bad;id/logs", headers=hdrs)
+            peer = client.get(f"/api/node/{'b' * 64}/container/bad;id/logs", headers=hdrs)
             self.assertEqual(local.status_code, 400)
             self.assertEqual(peer.status_code, 400)
+            # And without the token, the guard rejects before the route.
+            self.assertEqual(client.get("/api/container/bad;id/logs").status_code, 401)
         finally:
             app.stop()
 

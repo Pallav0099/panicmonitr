@@ -83,97 +83,141 @@ def _parse_time(value: str, anchor: datetime | None = None) -> datetime:
     return dt
 
 
+# Commands (exactly one per invocation). dest names are validated against this
+# list after parsing so help can be split into readable groups while keeping the
+# old "exactly one mode" guarantee.
+_COMMAND_DESTS = (
+    "init", "show_identity", "reset_password",
+    "add_peer", "remove_peer", "revoke_peer", "list_peers",
+    "set_permissions", "add_permission", "set_tags", "add_tag", "remove_tag",
+    "set_maintenance", "clear_maintenance", "list_maintenance",
+    "uptime", "history", "test_webhook", "fetch_dashboard", "dashboard_url",
+    "daemon", "tui",
+    "install_service", "uninstall_service", "migrate", "rotate_credential",
+    "selftest",
+)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="panic-monitor",
-        description="P2P health monitoring daemon for the PanicLab ecosystem (flat-peer model)",
+        description="P2P health monitoring daemon for the PanicLab ecosystem (flat-peer model).",
+        epilog=(
+            "Run exactly one COMMAND; option flags (--alias, --interval, ...) attach to it.\n"
+            "Example:\n"
+            "  panic-monitor --add-peer <NODE_ID> --alias web --permissions monitor,shell"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    mode = parser.add_mutually_exclusive_group(required=True)
+    # ── Commands ────────────────────────────────────────────────────────
+    g_identity = parser.add_argument_group("identity commands")
+    g_identity.add_argument("--init", action="store_true", help="Initialize identity (generate or seal secret.key and write genesis log entry)")
+    g_identity.add_argument("--show-identity", action="store_true", help="Print this device's NodeID (no password required)")
+    g_identity.add_argument("--reset-password", action="store_true", help="Re-seal the existing identity under a new password")
 
-    mode.add_argument("--init", action="store_true", help="Initialize identity (generate or seal secret.key and write genesis log entry)")
-    mode.add_argument("--show-identity", action="store_true", help="Print this device's NodeID (no password required)")
-    mode.add_argument("--reset-password", action="store_true", help="Re-seal the existing identity under a new password")
+    g_peers = parser.add_argument_group("peer & permission commands")
+    g_peers.add_argument("--add-peer", type=str, metavar="NODE_ID", help="Trust a peer by NodeID (use --alias/--permissions/--tags to configure)")
+    g_peers.add_argument("--remove-peer", type=str, metavar="NODE_ID", help="Revoke a peer (append revoke_peer op to the log)")
+    g_peers.add_argument("--revoke-peer", type=str, metavar="NODE_ID", help="Revoke a peer (append revoke_peer op to the log)")
+    g_peers.add_argument("--list-peers", action="store_true", help="List trusted peers (no password required)")
+    g_peers.add_argument("--set-permissions", nargs=2, metavar=("TARGET", "CSV"),
+                         help="REPLACE a peer's full permission set (alias or NodeID). "
+                              "CSV from: monitor,view_dashboard,shell,chat,split,call,drop")
+    g_peers.add_argument("--add-permission", nargs=2, metavar=("TARGET", "PERM"),
+                         help="ADD permission(s) to a peer, keeping existing ones (alias or NodeID). "
+                              "PERM is one value or a CSV, e.g. shell or view_dashboard,shell")
+    g_peers.add_argument("--set-tags", nargs=2, metavar=("TARGET", "CSV"), help="Replace a peer's tags (alias or NodeID)")
+    g_peers.add_argument("--add-tag", nargs=2, metavar=("TARGET", "TAG"), help="Add a tag to a peer")
+    g_peers.add_argument("--remove-tag", nargs=2, metavar=("TARGET", "TAG"), help="Remove a tag from a peer")
 
-    mode.add_argument("--add-peer", type=str, metavar="NODE_ID", help="Trust a peer by NodeID")
-    mode.add_argument("--remove-peer", type=str, metavar="NODE_ID", help="Revoke a peer (append revoke_peer op to the log)")
-    mode.add_argument("--revoke-peer", type=str, metavar="NODE_ID", help="Revoke a peer (append revoke_peer op to the log)")
-    mode.add_argument("--list-peers", action="store_true", help="List trusted peers (no password required)")
+    g_maint = parser.add_argument_group("maintenance commands")
+    g_maint.add_argument("--set-maintenance", nargs=3, metavar=("TARGET", "START", "END"),
+                         help="Schedule a maintenance window (ISO timestamps or '+1h' / '+30m' / '+2d' / '+0' for now)")
+    g_maint.add_argument("--clear-maintenance", type=str, metavar="TARGET", help="Clear a peer's maintenance window")
+    g_maint.add_argument("--list-maintenance", action="store_true", help="List peers currently in maintenance")
 
-    mode.add_argument("--set-permissions", nargs=2, metavar=("TARGET", "CSV"),
-                      help="Replace a peer's permissions (alias or NodeID). REPLACES the full set -- "
-                           "CSV from: monitor,view_dashboard,shell,chat,split,call,drop")
-    mode.add_argument("--set-tags", nargs=2, metavar=("TARGET", "CSV"), help="Replace a peer's tags (alias or NodeID)")
-    mode.add_argument("--add-tag", nargs=2, metavar=("TARGET", "TAG"), help="Add a tag to a peer")
-    mode.add_argument("--remove-tag", nargs=2, metavar=("TARGET", "TAG"), help="Remove a tag from a peer")
+    g_query = parser.add_argument_group("query commands")
+    g_query.add_argument("--uptime", type=str, metavar="TARGET", help="Print uptime %% for a peer (alias or NodeID)")
+    g_query.add_argument("--history", type=str, metavar="TARGET", help="Dump recent latency history for a peer")
+    g_query.add_argument("--test-webhook", action="store_true", help="Fire a test notification to --webhook-url and exit")
+    g_query.add_argument("--fetch-dashboard", type=str, metavar="TARGET", help="Pull a sibling peer's dashboard over the status ALPN (requires view_dashboard permission from them)")
+    g_query.add_argument("--dashboard-url", action="store_true", help="Print the tokenized local dashboard URL (reads the runtime token file written by the daemon)")
 
-    mode.add_argument("--set-maintenance", nargs=3, metavar=("TARGET", "START", "END"),
-                      help="Schedule a maintenance window (ISO timestamps or '+1h' / '+30m' / '+2d' / '+0' for now)")
-    mode.add_argument("--clear-maintenance", type=str, metavar="TARGET", help="Clear a peer's maintenance window")
-    mode.add_argument("--list-maintenance", action="store_true", help="List peers currently in maintenance")
+    g_run = parser.add_argument_group("run commands")
+    g_run.add_argument("--daemon", action="store_true", help="Run headless daemon")
+    g_run.add_argument("--tui", action="store_true", help="Launch interactive TUI")
 
-    mode.add_argument("--uptime", type=str, metavar="TARGET", help="Print uptime %% for a peer (alias or NodeID)")
-    mode.add_argument("--history", type=str, metavar="TARGET", help="Dump recent latency history for a peer")
-    mode.add_argument("--test-webhook", action="store_true", help="Fire a test notification to --webhook-url and exit")
-    mode.add_argument("--fetch-dashboard", type=str, metavar="TARGET", help="Pull a sibling peer's dashboard over the status ALPN (requires view_dashboard permission from them)")
-
-    mode.add_argument("--daemon", action="store_true", help="Run headless daemon")
-    mode.add_argument("--tui", action="store_true", help="Launch interactive TUI")
-
-    mode.add_argument("--install-service", action="store_true", help="Render and install the systemd unit (user mode by default, system mode if run as root)")
-    mode.add_argument("--uninstall-service", action="store_true", help="Disable and remove the systemd unit")
-    mode.add_argument("--migrate", action="store_true", help="Copy state files from legacy locations (CWD, /etc, /var/lib) into XDG paths")
-    mode.add_argument("--rotate-credential", action="store_true", help="Re-encrypt the stored credential under the current backend (does not touch the seed)")
+    g_svc = parser.add_argument_group("service commands")
+    g_svc.add_argument("--install-service", action="store_true", help="Render and install the systemd unit (user mode by default, system mode if run as root)")
+    g_svc.add_argument("--uninstall-service", action="store_true", help="Disable and remove the systemd unit")
+    g_svc.add_argument("--migrate", action="store_true", help="Copy state files from legacy locations (CWD, /etc, /var/lib) into XDG paths")
+    g_svc.add_argument("--rotate-credential", action="store_true", help="Re-encrypt the stored credential under the current backend (does not touch the seed)")
     # Hidden: import + exercise native deps and exit 0. Used by CI to verify a
     # frozen onefile binary actually bundled its compiled extensions.
-    mode.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
+    g_svc.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
 
-    parser.add_argument("--version", action="version", version=f"panic-monitor {__version__}")
+    # ── Options ─────────────────────────────────────────────────────────
+    g_general = parser.add_argument_group("general options")
+    g_general.add_argument("--version", action="version", version=f"panic-monitor {__version__}")
+    g_general.add_argument("--debug", action="store_true", help="Enable DEBUG-level logging (default: INFO)")
+    g_general.add_argument("--force-fresh", action="store_true", help="Wipe legacy account/mesh artifacts during --init")
 
-    parser.add_argument("--debug", action="store_true", help="Enable DEBUG-level logging (default: INFO)")
-    parser.add_argument("--alias", type=str, default=None, help="Friendly name for --add-peer")
-    parser.add_argument("--permissions", type=str, default="monitor", help="Comma-separated permissions for --add-peer: monitor,view_dashboard,shell,chat,split,call,drop")
-    parser.add_argument("--tags", type=str, default=None, help="Comma-separated tags for --add-peer")
-    parser.add_argument("--filter-tag", type=str, default=None, help="Filter --list-peers by tag")
-    parser.add_argument("--interval", type=int, default=30, help="Heartbeat interval in seconds (default: 30)")
-    parser.add_argument("--peers", type=Path, default=paths.default_peers_path(), help="Path to peers.json (materialized cache)")
-    parser.add_argument("--log-path", type=Path, default=paths.default_log_path(), help="Path to the append-only trust log")
-    parser.add_argument("--identity", type=Path, default=paths.default_identity_path(), help="Path to device secret key (sealed ciphertext)")
-    parser.add_argument("--identity-meta", type=Path, default=paths.default_meta_path(), help="Path to identity metadata (salt + NodeID)")
-    parser.add_argument("--history-db", type=Path, default=paths.default_history_path(), help="Path to SQLite latency history store")
-    parser.add_argument("--retain-days", type=int, default=DEFAULT_RETAIN_DAYS, help="History retention in days (default: 30)")
-    parser.add_argument("--window", type=str, default=None, help="Window for --uptime (1h, 24h, 7d, 30d)")
-    parser.add_argument("--hours", type=int, default=24, help="Range in hours for --history (default: 24)")
-    parser.add_argument("--webhook-url", type=str, default=None, help="POST monitor_down/monitor_up events to this URL")
-    parser.add_argument("--down-after", type=int, default=3, help="Consecutive failed probes before DEAD (default: 3)")
-    parser.add_argument("--up-after", type=int, default=1, help="Consecutive successes before ALIVE again (default: 1)")
-    parser.add_argument("--flap-min-dwell", type=int, default=60, help="Minimum seconds between webhook firings for the same peer (default: 60)")
-    parser.add_argument("--refresh-after-failures", type=int, default=5,
-                        help="Consecutive stats-pull failures (per peer, while peer is ALIVE) before rebuilding the local iroh node to escape a stuck path-picker. 0 disables. Default: 5")
-    parser.add_argument("--refresh-cooldown", type=int, default=60,
-                        help="Minimum seconds between iroh node rebuilds. Default: 60")
-    parser.add_argument("--status-bind", type=str, default="127.0.0.1:8080", help="HTTP dashboard bind (host:port, or empty string to disable). Default: 127.0.0.1:8080")
-    parser.add_argument("--push-to", type=str, action="append", default=None, metavar="NODE_ID", help="Push a heartbeat to this peer every --interval seconds (repeatable; for behind-NAT setups)")
-    parser.add_argument("--force-fresh", action="store_true", help="Wipe legacy account/mesh artifacts during --init")
-    # Phase 0-3 additions
-    parser.add_argument("--role", type=str, default="both", choices=[r.value for r in NodeRole],
+    g_peeropt = parser.add_argument_group("peer options (for --add-peer / --list-peers)")
+    g_peeropt.add_argument("--alias", type=str, default=None, help="Friendly name for --add-peer")
+    g_peeropt.add_argument("--permissions", type=str, default="monitor", help="Comma-separated permissions for --add-peer: monitor,view_dashboard,shell,chat,split,call,drop")
+    g_peeropt.add_argument("--tags", type=str, default=None, help="Comma-separated tags for --add-peer")
+    g_peeropt.add_argument("--filter-tag", type=str, default=None, help="Filter --list-peers by tag")
+    g_peeropt.add_argument("--window", type=str, default=None, help="Window for --uptime (1h, 24h, 7d, 30d)")
+    g_peeropt.add_argument("--hours", type=int, default=24, help="Range in hours for --history (default: 24)")
+
+    g_tune = parser.add_argument_group("daemon & tuning options")
+    g_tune.add_argument("--interval", type=int, default=30, help="Heartbeat interval in seconds (default: 30)")
+    g_tune.add_argument("--stats-interval", type=int, default=10, help="System stats collection interval in seconds (default: 10)")
+    g_tune.add_argument("--role", type=str, default="both", choices=[r.value for r in NodeRole],
                         help="Node role: monitored, monitoring, or both (default: both)")
-    parser.add_argument("--dashboard-port", type=int, default=42069,
-                        help="Port for Flask+Plotly web dashboard (default: 42069; 0 to disable)")
-    parser.add_argument("--stats-interval", type=int, default=10,
-                        help="System stats collection interval in seconds (default: 10)")
-    parser.add_argument("--no-docker", action="store_true",
-                        help="Disable Docker container stats collection")
-    parser.add_argument("--logstore-db", type=Path, default=paths.default_logstore_path(),
-                        help="Path to the server-side logstore SQLite DB (default: <data_dir>/logstore.db)")
-    parser.add_argument("--password-from", type=str, default=None,
-                        choices=["systemd-creds", "keyring", "stdin", "env", "pinentry"],
-                        help="Password backend (default: systemd-creds for install-service; env for back-compat at runtime)")
-    parser.add_argument("--user", action="store_true", help="install-service: install as a user unit (default when not running as root)")
-    parser.add_argument("--system", action="store_true", help="install-service: install as a system unit (default when running as root)")
-    parser.add_argument("--force", action="store_true", help="install-service: overwrite an existing unit file")
-    parser.add_argument("--rotate-password", action="store_true", help="install-service: re-encrypt the stored credential under the current backend")
-    return parser.parse_args()
+    g_tune.add_argument("--dashboard-port", type=int, default=42069, help="Port for Flask web dashboard (default: 42069; 0 to disable)")
+    g_tune.add_argument("--status-bind", type=str, default="127.0.0.1:8080", help="HTTP status page bind (host:port, or empty string to disable). Default: 127.0.0.1:8080")
+    g_tune.add_argument("--no-docker", action="store_true", help="Disable Docker container stats collection")
+    g_tune.add_argument("--webhook-url", type=str, default=None, help="POST monitor_down/monitor_up events to this URL")
+    g_tune.add_argument("--down-after", type=int, default=3, help="Consecutive failed probes before DEAD (default: 3)")
+    g_tune.add_argument("--up-after", type=int, default=1, help="Consecutive successes before ALIVE again (default: 1)")
+    g_tune.add_argument("--flap-min-dwell", type=int, default=60, help="Minimum seconds between webhook firings for the same peer (default: 60)")
+    g_tune.add_argument("--refresh-after-failures", type=int, default=5,
+                        help="Consecutive stats-pull failures (per peer, while peer is ALIVE) before rebuilding the local iroh node to escape a stuck path-picker. 0 disables. Default: 5")
+    g_tune.add_argument("--refresh-cooldown", type=int, default=60, help="Minimum seconds between iroh node rebuilds. Default: 60")
+    g_tune.add_argument("--push-to", type=str, action="append", default=None, metavar="NODE_ID", help="Push a heartbeat to this peer every --interval seconds (repeatable; for behind-NAT setups)")
+    g_tune.add_argument("--retain-days", type=int, default=DEFAULT_RETAIN_DAYS, help="History retention in days (default: 30)")
+
+    g_paths = parser.add_argument_group("file path options")
+    g_paths.add_argument("--peers", type=Path, default=paths.default_peers_path(), help="Path to peers.json (materialized cache)")
+    g_paths.add_argument("--log-path", type=Path, default=paths.default_log_path(), help="Path to the append-only trust log")
+    g_paths.add_argument("--identity", type=Path, default=paths.default_identity_path(), help="Path to device secret key (sealed ciphertext)")
+    g_paths.add_argument("--identity-meta", type=Path, default=paths.default_meta_path(), help="Path to identity metadata (salt + NodeID)")
+    g_paths.add_argument("--history-db", type=Path, default=paths.default_history_path(), help="Path to SQLite latency history store")
+    g_paths.add_argument("--logstore-db", type=Path, default=paths.default_logstore_path(), help="Path to the server-side logstore SQLite DB (default: <data_dir>/logstore.db)")
+
+    g_svcopt = parser.add_argument_group("service install options (for --install-service)")
+    g_svcopt.add_argument("--password-from", type=str, default=None,
+                          choices=["systemd-creds", "machine-id", "keyring", "stdin", "env", "pinentry"],
+                          help="Password backend. install-service auto-selects systemd-creds (systemd >=250/256) "
+                               "or machine-id (portable, headless) when unset; at runtime defaults to env for back-compat")
+    g_svcopt.add_argument("--user", action="store_true", help="Install as a user unit (default when not running as root)")
+    g_svcopt.add_argument("--system", action="store_true", help="Install as a system unit (default when running as root)")
+    g_svcopt.add_argument("--force", action="store_true", help="Overwrite an existing unit file")
+    g_svcopt.add_argument("--rotate-password", action="store_true", help="Re-encrypt the stored credential under the current backend")
+
+    args = parser.parse_args()
+
+    # Enforce exactly one command (replaces the old mutually-exclusive group,
+    # which couldn't span the help groups above).
+    selected = [d for d in _COMMAND_DESTS if getattr(args, d)]
+    if len(selected) != 1:
+        if not selected:
+            parser.error("no command given -- pick exactly one (e.g. --init, --add-peer, --daemon, --list-peers). See --help.")
+        flags = ", ".join("--" + d.replace("_", "-") for d in selected)
+        parser.error(f"only one command at a time; got: {flags}")
+    return args
 
 
 def configure_logging(*, tui: bool = False, debug: bool = False) -> None:
@@ -441,6 +485,38 @@ def _run_selftest() -> None:
         print(f"selftest FAILED: service template missing at {TEMPLATE_PATH}", file=sys.stderr)
         sys.exit(1)
 
+    # When frozen, confirm our bundled lib dir does NOT leak into spawned system
+    # binaries (systemd-creds, systemctl, bash) via LD_LIBRARY_PATH. A leak makes
+    # those tools load our older bundled libcrypto and crash on newer hosts.
+    if getattr(sys, "frozen", False):
+        import subprocess
+        from src.sysenv import system_env
+
+        meipass = getattr(sys, "_MEIPASS", "")
+        child = subprocess.run(
+            ["sh", "-c", "echo $LD_LIBRARY_PATH"],
+            capture_output=True, text=True, env=system_env(),
+        ).stdout.strip()
+        if meipass and meipass in child:
+            print(f"selftest FAILED: bundled lib path leaked to subprocess: {child!r}", file=sys.stderr)
+            sys.exit(1)
+
+    # Exercise the machine-id backend crypto path (argon2 KDF + SecretBox),
+    # in-memory, no disk writes. Skipped if the host has no /etc/machine-id.
+    import nacl.secret as _secret
+    import nacl.utils as _nutils
+    from src import password as _pw
+
+    try:
+        _k = _pw._derive_key(_nutils.random(16))
+    except RuntimeError:
+        _k = None  # no machine-id here; backend simply won't be selectable
+    if _k is not None:
+        _box = _secret.SecretBox(_k)
+        if _box.decrypt(_box.encrypt(b"probe")) != b"probe":
+            print("selftest FAILED: machine-id crypto round-trip mismatch", file=sys.stderr)
+            sys.exit(1)
+
     print("selftest OK")
     sys.exit(0)
 
@@ -471,7 +547,8 @@ def cli_main() -> None:
         else:
             system_flag = None  # autodetect from euid
 
-        backend = args.password_from or "systemd-creds"
+        # None lets install_service auto-select systemd-creds vs machine-id.
+        backend = args.password_from
 
         if args.uninstall_service:
             sys.exit(uninstall_service(system=system_flag))
@@ -554,6 +631,20 @@ def cli_main() -> None:
             print(f"Reset failed: {exc}")
             sys.exit(1)
         print(f"Password updated. Node ID unchanged: {meta.node_id}")
+        return
+
+    # --- Dashboard URL (read-only, no password) ---------------------------
+    if args.dashboard_url:
+        configure_logging(debug=args.debug)
+        url_path = paths.default_dashboard_url_path()
+        if not url_path.exists():
+            print(
+                "No dashboard token found -- is the daemon running with the dashboard "
+                "enabled (--dashboard-port != 0)?",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(url_path.read_text().strip())
         return
 
     # --- Show identity (read-only, no password) ---------------------------
@@ -721,12 +812,17 @@ def cli_main() -> None:
         )
 
         if _via_socket():
+            # Sensitive trust mutation: require the identity password (verified by
+            # the daemon). Force interactive entry so a configured password
+            # backend can't silently auto-authorize.
+            pw = _interactive_password("Identity password (authorize add-peer): ")
             try:
                 control_client.post("/v1/peers", {
                     "node_id": args.add_peer,
                     "alias": args.alias,
                     "permissions": perms,
                     "tags": tags or [],
+                    "password": pw,
                 })
                 tag_str = f" tags={tags}" if tags else ""
                 print(f"Peer trusted: {args.alias or args.add_peer[:12]}  permissions={perms}{tag_str}")
@@ -763,7 +859,8 @@ def cli_main() -> None:
                 target_nid = target_raw if target_raw in idx else alias_idx.get(target_raw)
                 if target_nid is None:
                     print(f"Error: unknown peer '{target_raw}'"); sys.exit(1)
-                control_client.put(f"/v1/peers/{target_nid}/perms", {"permissions": perms})
+                pw = _interactive_password("Identity password (authorize set-permissions): ")
+                control_client.put(f"/v1/peers/{target_nid}/perms", {"permissions": perms, "password": pw})
                 print(f"Permissions for {target_raw} set to {perms}")
                 return
             except control_client.ControlClientError as exc:
@@ -779,6 +876,48 @@ def cli_main() -> None:
             print(f"Permissions for {target_raw} set to {perms}")
         else:
             print("Failed to set permissions (peer missing, revoked, or invalid perms).")
+        return
+
+    # --- Add permission (merge into existing set) -------------------------
+    if args.add_permission:
+        configure_logging(debug=args.debug)
+        target_raw, csv = args.add_permission
+        new_perms = [p.strip() for p in csv.split(",") if p.strip()]
+
+        def _merge(current: list[str]) -> list[str]:
+            return current + [p for p in new_perms if p not in current]
+
+        # Socket path -----------------------------------------------------
+        if _via_socket():
+            try:
+                resp = control_client.get("/v1/peers")
+                idx = {p["node_id"]: p for p in resp.get("peers", [])}
+                alias_idx = {p["alias"]: p["node_id"] for p in resp.get("peers", []) if p.get("alias")}
+                target_nid = target_raw if target_raw in idx else alias_idx.get(target_raw)
+                if target_nid is None:
+                    print(f"Error: unknown peer '{target_raw}'"); sys.exit(1)
+                current = list(idx[target_nid].get("permissions", []))
+                merged = _merge(current)
+                pw = _interactive_password("Identity password (authorize add-permission): ")
+                control_client.put(f"/v1/peers/{target_nid}/perms", {"permissions": merged, "password": pw})
+                print(f"Permissions for {target_raw}: {current} -> {merged}")
+                return
+            except control_client.ControlClientError as exc:
+                sys.exit(_socket_err(exc))
+
+        # Direct fallback -------------------------------------------------
+        seed, node_id = _unlock_or_exit(args.identity, args.identity_meta)
+        _log, trust = _build_trust(seed, node_id, args.log_path, args.peers)
+        target_nid, err = trust.resolve_target(target_raw)
+        if err:
+            print(f"Error: {err}"); sys.exit(1)
+        peer = trust.get_peer(target_nid)
+        current = list(peer.permissions) if peer else []
+        merged = _merge(current)
+        if trust.update_permissions(target_nid, merged):
+            print(f"Permissions for {target_raw}: {current} -> {merged}")
+        else:
+            print("Failed to add permissions (peer missing, revoked, or invalid perms).")
         return
 
     # --- Tags (Slice C) ---------------------------------------------------
@@ -991,6 +1130,8 @@ def cli_main() -> None:
         include_docker=not args.no_docker,
         refresh_after_failures=args.refresh_after_failures,
         refresh_cooldown_seconds=args.refresh_cooldown,
+        identity_path=args.identity,
+        meta_path=args.identity_meta,
     )
 
     if args.fetch_dashboard:

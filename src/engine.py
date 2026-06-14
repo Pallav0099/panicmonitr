@@ -825,8 +825,13 @@ class MonitorEngine:
         # iroh node-refresh mitigation (see docs/network-resilience-roadmap.md A.2)
         refresh_after_failures: int = 5,
         refresh_cooldown_seconds: int = 60,
+        # Sealed-identity paths — used to verify the password gating trust mutations.
+        identity_path: Optional[Path] = None,
+        meta_path: Optional[Path] = None,
     ) -> None:
         self._secret_key = secret_key
+        self._identity_path = identity_path
+        self._meta_path = meta_path
         self._peers_path = peers_path
         self._log_path = log_path
         self._trust = trust
@@ -2173,7 +2178,9 @@ class MonitorEngine:
         try:
             master_fd, slave_fd = pty.openpty()
             os.set_blocking(master_fd, False)
-            env = {**os.environ, "TERM": "xterm-256color"}
+            from src.sysenv import system_env
+            # Strip the bundled lib path so the peer's shell uses host libraries.
+            env = system_env({"TERM": "xterm-256color"})
             proc = await asyncio.create_subprocess_exec(
                 "/bin/bash", "-i",
                 stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
@@ -2505,6 +2512,24 @@ class MonitorEngine:
     # ------------------------------------------------------------------
     # Peer management (TUI bridge)
     # ------------------------------------------------------------------
+
+    def verify_identity_password(self, password: str) -> bool:
+        """Verify *password* against the sealed identity.
+
+        Gates sensitive trust mutations (add-peer, set/add-permission) requested
+        over the control socket or the dashboard. Relies on ``unlock_identity``
+        raising on a wrong password — its SecretBox MAC check is the
+        constant-time comparison, and the ~argon2 cost naturally rate-limits
+        brute force. The unsealed seed is discarded.
+        """
+        if not password or self._identity_path is None or self._meta_path is None:
+            return False
+        from src.identity import unlock_identity
+        try:
+            unlock_identity(password, self._identity_path, self._meta_path)
+            return True
+        except (ValueError, FileNotFoundError):
+            return False
 
     def add_peer(
         self,

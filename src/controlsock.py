@@ -188,6 +188,8 @@ class _ControlHandler(http.server.BaseHTTPRequestHandler):
                 return self._send_json({"peers": peers})
             if method == "POST":
                 body = self._read_body()
+                if not engine.verify_identity_password(body.get("password") or ""):
+                    return self._send_error(403, "password verification failed")
                 node_id = body.get("node_id")
                 alias = body.get("alias")
                 perms = body.get("permissions") or ["monitor"]
@@ -218,6 +220,8 @@ class _ControlHandler(http.server.BaseHTTPRequestHandler):
             if method != "PUT":
                 return self._send_error(405, "use PUT")
             body = self._read_body()
+            if not engine.verify_identity_password(body.get("password") or ""):
+                return self._send_error(403, "password verification failed")
             perms = body.get("permissions")
             if not isinstance(perms, list):
                 return self._send_error(400, "permissions must be a list")

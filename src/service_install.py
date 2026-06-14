@@ -21,6 +21,7 @@ from pathlib import Path
 from loguru import logger
 
 from src import paths
+from src.sysenv import system_env
 
 SERVICE_NAME = "panic-monitor.service"
 
@@ -86,7 +87,41 @@ def _unit_dir(*, system: bool) -> Path:
 def _systemctl(*args: str, system: bool) -> subprocess.CompletedProcess:
     cmd = ["systemctl"] + ([] if system else ["--user"]) + list(args)
     logger.debug("[install-service] $ {}", " ".join(cmd))
-    return subprocess.run(cmd, check=False)
+    return subprocess.run(cmd, check=False, env=system_env())
+
+
+def _systemd_version() -> int | None:
+    """Best-effort major systemd version, or None if it can't be determined."""
+    if shutil.which("systemctl") is None:
+        return None
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--version"],
+            check=False, capture_output=True, text=True, env=system_env(),
+        )
+    except OSError:
+        return None
+    first_line = (proc.stdout or "").split("\n", 1)[0]  # "systemd 257 (257.5-1)"
+    for token in first_line.split():
+        if token.isdigit():
+            return int(token)
+    return None
+
+
+def _systemd_creds_viable(*, system: bool) -> bool:
+    """Whether systemd-creds will actually work for this install mode.
+
+    Needs the binary (systemd >= 250) and, in user mode, version >= 256 so the
+    per-user systemd instance can decrypt a user-scoped credential. When the
+    version can't be read, assume OK for system mode but be cautious (False) for
+    user mode so we fall back to a backend that definitely works.
+    """
+    if shutil.which("systemd-creds") is None:
+        return False
+    ver = _systemd_version()
+    if ver is None:
+        return system
+    return ver >= 250 if system else ver >= 256
 
 
 def _render_unit(
@@ -177,6 +212,7 @@ def _encrypt_credential(password: str, dest: Path, *, system: bool) -> None:
         input=password.encode(),
         check=False,
         capture_output=True,
+        env=system_env(),
     )
     if proc.returncode != 0:
         raise RuntimeError(
@@ -201,15 +237,27 @@ def install_service(
     *,
     system: bool | None = None,
     force: bool = False,
-    password_backend: str = "systemd-creds",
+    password_backend: str | None = None,
     rotate_password: bool = False,
 ) -> int:
     """Render the unit, write it, and enable + start the service.
 
-    Returns 0 on success, non-zero on failure.
+    ``password_backend=None`` auto-selects: systemd-creds when it's actually
+    usable for this mode (systemd >= 250 system / >= 256 user), otherwise the
+    portable machine-id encrypted-file backend, which works on any distro and
+    headless. Returns 0 on success, non-zero on failure.
     """
     if system is None:
         system = paths.system_mode()
+
+    if password_backend is None:
+        password_backend = (
+            "systemd-creds" if _systemd_creds_viable(system=system) else "machine-id"
+        )
+        ver = _systemd_version()
+        why = f"systemd {ver}" if ver is not None else "systemd version unknown"
+        print(f"Auto-selected password backend: {password_backend} ({why}, "
+              f"{'system' if system else 'user'} mode).")
 
     unit_dir = _unit_dir(system=system)
     unit_path = unit_dir / SERVICE_NAME
@@ -225,8 +273,8 @@ def install_service(
     if password_backend == "systemd-creds":
         if shutil.which("systemd-creds") is None:
             print(
-                "systemd-creds not found on PATH. Install systemd >= 250 or "
-                "pick another backend with --password-from.",
+                "systemd-creds not found on PATH. Install systemd >= 250, or use "
+                "--password-from machine-id (works anywhere) or another backend.",
                 file=sys.stderr,
             )
             return 1
@@ -240,6 +288,19 @@ def install_service(
                 print(str(exc), file=sys.stderr)
                 return 1
             print(f"Encrypted credential written to {credential_file}")
+    elif password_backend == "machine-id":
+        from src.password import seal_password_to_disk
+
+        enc_path = config_dir / paths.PASSWORD_ENC_NAME
+        if not enc_path.exists() or rotate_password:
+            print("Enter the identity password (encrypted at rest, bound to this host's machine-id).")
+            password = _prompt_password()
+            try:
+                seal_password_to_disk(password, config_dir)
+            except RuntimeError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            print(f"Encrypted credential written to {enc_path}")
     elif password_backend == "keyring":
         try:
             import keyring

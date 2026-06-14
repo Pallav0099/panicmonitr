@@ -98,21 +98,38 @@ Open `http://127.0.0.1:42069/`. After both sides add each other, the peer
 appears in the fleet view within one probe interval (30s default). Click any
 card to see live CPU, memory, disk, processes, and containers.
 
-After `--install-service`, all admin commands (`--add-peer`, `--list-peers`,
-`--set-maintenance`, ...) talk to the running daemon over the control socket.
-No further password prompts, no restarts.
+After `--install-service`, admin commands talk to the running daemon over the
+control socket -- no restarts. Read-only commands (`--list-peers`, `--uptime`,
+...) need nothing; the **sensitive trust mutations** (`--add-peer`,
+`--set-permissions`, `--add-permission`) prompt for your identity password to
+authorize the change.
 
 ---
 
 ## Prerequisites
 
-- **Linux** with systemd >= 250 (system mode) or >= 256 (user mode with `systemd-creds`)
+- **Linux** with systemd (any recent version -- see password backends below)
 - **Python 3.12+** -- only for the *from source* install; the prebuilt binary bundles its own
 - **Docker** (optional -- pass `--no-docker` to skip container stats)
-- TPM2 is nice-to-have; `systemd-creds` falls back to per-user host key
 
-For systemd < 256 in user mode, use the keyring backend:
-`panic-monitor --install-service --password-from keyring`
+### Password backends
+
+`--install-service` stores your identity password so the daemon can unlock itself
+at boot. It **auto-selects** the backend -- you don't normally pass anything:
+
+| Backend | When auto-chosen | How it protects the password |
+|---|---|---|
+| `systemd-creds` | systemd >= 250 (system) / >= 256 (user) | host-bound, encrypted via systemd's credential key |
+| `machine-id` | anything older, or headless | encrypted at rest, key derived from `/etc/machine-id` (argon2id) -- works on any distro with no D-Bus/keyring |
+
+So on current LTS distros (Ubuntu 22.04/24.04, Debian 12 -- all < systemd 256 in
+user mode) and on headless servers, install **just works** via the portable
+`machine-id` backend. The `machine-id` ciphertext is bound to the host: copying
+it to another machine yields nothing. It is encryption *at rest*, not protection
+against a process already running as your user on the same box -- for that, use a
+systemd >= 256 host with `systemd-creds`.
+
+Force a specific backend with `--password-from {systemd-creds,machine-id,keyring,env,stdin,pinentry}`.
 
 ---
 
@@ -130,8 +147,9 @@ panic-monitor --list-peers
 panic-monitor --list-peers --filter-tag prod
 panic-monitor --revoke-peer <NODE_ID>        # signed op, auditable
 
-# Change permissions of an existing peer (REPLACES the full set, signed op)
-panic-monitor --set-permissions api-server "monitor,shell"
+# Permissions (signed ops). Two verbs:
+panic-monitor --add-permission api-server shell        # ADDS, keeps existing -> monitor,shell
+panic-monitor --set-permissions api-server "monitor,shell"  # REPLACES the whole set
 
 # Tags
 panic-monitor --set-tags api-server "prod,db"
@@ -142,6 +160,11 @@ panic-monitor --remove-tag api-server staging
 panic-monitor --set-maintenance api-server +0 +2h
 panic-monitor --clear-maintenance api-server
 ```
+
+`--add-peer`, `--set-permissions`, and `--add-permission` are gated by your
+**identity password** (you'll be prompted) -- the same password that unlocks
+your signing key. `--add-permission` adds to the existing set; `--set-permissions`
+replaces it wholesale.
 
 Trust is **per-direction** -- for full bidirectional monitoring, both sides
 must `--add-peer` each other with at least `monitor` permission.
@@ -177,9 +200,10 @@ authenticated RCE into that node, so it is **strictly default-deny**:
   permission. It is **not** implied by `monitor` or `view_dashboard` (no
   fallback). The `*` wildcard *does* grant it -- avoid `*` if you don't want
   shell exposure.
-- The HTTP/WebSocket surface is loopback-only and unauthenticated, same as the
-  rest of the dashboard -- anyone with access to `:42069` on your machine can
-  drive shells into peers that granted you `shell`.
+- The dashboard at `:42069` is loopback-only and **token-gated** (see
+  [Dashboard](#dashboard)): opening a shell requires the dashboard token, and
+  the WebSocket is rejected from foreign browser origins. Adding peers /
+  changing permissions additionally requires your identity password.
 - Every session is recorded as a signed, tamper-evident `shell_open` /
   `shell_close` op in the **host's** trust log (`log.jsonl`).
 - Under system-mode systemd the spawned shell inherits the unit's sandbox
@@ -197,6 +221,29 @@ panic-monitor --set-permissions api-server "monitor,shell"
 
 ---
 
+## Security model
+
+Three surfaces, three layers of authentication:
+
+- **Identity** -- each node has an Ed25519 keypair; the secret key is sealed at
+  rest under an argon2id key derived from your password (`secret.key`).
+- **Trust is an append-only signed log** -- default-deny, per-peer, per-protocol
+  grants; `peers.json` is only a cache re-materialized from the log.
+- **Peer-to-peer (iroh):** every QUIC connection is authenticated by the peer's
+  Node ID (its public key) in the TLS handshake, and handlers authorize *that*
+  identity against the trust log. A peer can't impersonate another or forge data
+  for one -- identity comes from the connection, never the request payload.
+- **Control socket (CLI ↔ daemon):** a `0600` Unix socket, with every request
+  checked via `SO_PEERCRED` so only the daemon's own user can drive it.
+- **Dashboard (`:42069`):** loopback-only, gated by a per-startup token plus an
+  `Origin`/`Host` allowlist (blocks browser CSRF / DNS-rebinding). The sensitive
+  trust mutations -- adding a peer, changing permissions -- additionally require
+  your identity password.
+- **Remote shell** is a dedicated `shell` grant, never implied by `monitor`, and
+  every session is a signed `shell_open`/`shell_close` entry in the trust log.
+
+---
+
 ## Roles
 
 `--role {monitored,monitoring,both}` (default: `both`):
@@ -211,12 +258,30 @@ panic-monitor --set-permissions api-server "monitor,shell"
 
 ## Dashboard
 
-Two HTTP surfaces, both loopback-only, no auth:
+Two HTTP surfaces, both bound to loopback:
 
-| Port | Source | Purpose |
-|---|---|---|
-| 42069 | Flask + Plotly | Live SPA dashboard -- polls `/api/dashboard` |
-| 8080 | stdlib `http.server` | Lightweight status page + `/status.json` |
+| Port | Source | Auth | Purpose |
+|---|---|---|---|
+| 42069 | Flask + Plotly | **token + Origin allowlist** | Live SPA dashboard -- polls `/api/dashboard` |
+| 8080 | stdlib `http.server` | none (read-only) | Lightweight status page + `/status.json` |
+
+The dashboard requires a per-startup **token**. The daemon prints the tokenized
+URL on startup; retrieve it any time with:
+
+```fish
+panic-monitor --dashboard-url        # -> http://127.0.0.1:42069/?t=…
+```
+
+Open that URL; the page strips the token from the address bar and replays it on
+API calls. Trusting a peer or changing permissions from the UI additionally
+prompts for your **identity password**.
+
+> **Never reverse-proxy `:42069` to a public interface without your own auth
+> layer in front.** The token is designed for same-host use; a proxy that
+> rewrites `Host`/`Origin` defeats the allowlist, and anyone who reaches the
+> port and obtains the token gets full dashboard access -- including PTY shells
+> into peers that granted you `shell`. Keep it on `127.0.0.1`; tunnel over SSH
+> or a mesh VPN (which bring their own auth) if you need it remotely.
 
 The main dashboard at `:42069` renders once and polls JSON. Scroll position,
 expanded containers, and hover state survive every refresh. The layout is built
@@ -270,15 +335,21 @@ User mode (default):
     secret.meta      Node ID + argon2 salt (0600)
     peers.json       materialized peer cache
     log.jsonl        append-only signed trust log
-    password.cred    systemd-creds encrypted password
+    password.cred    encrypted password -- systemd-creds backend (0600)
+    password.enc     encrypted password -- machine-id backend (0600)
+    password.salt    argon2 salt for the machine-id backend (0600)
 
 ~/.local/share/panic-monitor/
     history.db       probe latency + status timeseries
     logstore.db      system/container stats + rollups
 
 $XDG_RUNTIME_DIR/panic-monitor/
-    control.sock     daemon <-> CLI IPC
+    control.sock     daemon <-> CLI IPC (0600, owner-only)
+    dashboard.url    tokenized dashboard URL for --dashboard-url (0600)
 ```
+
+Only one of `password.cred` / `password.enc`+`password.salt` exists, depending
+on the chosen password backend.
 
 Root mode: `/etc/panic-monitor`, `/var/lib/panic-monitor`, `/run/panic-monitor`.
 
@@ -335,12 +406,15 @@ panic-monitor --help
 | `--add-peer NID [--alias X] [--permissions P] [--tags T]` | Trust a peer |
 | `--revoke-peer NID` | Revoke (logged, not deleted) |
 | `--list-peers [--filter-tag X]` | List trusted peers |
+| `--add-permission TARGET PERM` | Add permission(s), keeping existing |
+| `--set-permissions TARGET CSV` | Replace the full permission set |
 | `--set-tags TARGET CSV` | Replace tags |
 | `--set-maintenance TARGET START END` | Schedule maintenance window |
 | **Query** | |
 | `--uptime TARGET [--window 24h]` | Uptime % over window |
 | `--history TARGET [--hours 24]` | Raw probe stream |
 | `--fetch-dashboard TARGET` | Pull peer's dashboard once |
+| `--dashboard-url` | Print the tokenized local dashboard URL |
 | **Tuning** | |
 | `--role {monitored,monitoring,both}` | Node behavior (default: both) |
 | `--interval SECS` | Heartbeat probe interval (default: 30) |
@@ -354,7 +428,7 @@ panic-monitor --help
 | `--no-docker` | Skip container stats |
 | `--push-to NID` | Reverse heartbeat for NAT (repeatable) |
 | `--webhook-url URL` | POST alerts to this URL |
-| `--password-from BACKEND` | systemd-creds, keyring, stdin, env, pinentry |
+| `--password-from BACKEND` | systemd-creds, machine-id, keyring, stdin, env, pinentry (auto-selected if unset) |
 
 ### Non-systemd / Docker
 
@@ -385,6 +459,10 @@ per-service). Fix: `panic-monitor --install-service --force`
 
 **Dashboard `Connection refused` on 42069** -- daemon not running or webapp
 failed to bind. Check: `systemctl --user is-active panic-monitor.service`
+
+**Dashboard loads but stays empty / browser console shows `401`** -- you opened
+`:42069` without the auth token. Get the tokenized URL and open that:
+`panic-monitor --dashboard-url`
 
 **Peer alive but no stats** -- the remote hasn't granted you `monitor` or
 `view_dashboard`. Both sides need `--add-peer` with at least `monitor`.
@@ -423,7 +501,7 @@ panic-monitor --init && panic-monitor --install-service
 - **Log is authority** -- `peers.json` is a cache re-materialized after each signed append
 - **Delta-based stats pull** -- peers pull each other's stats over STATUS_ALPN every `--stats-interval` using monotonic sequence cursors. First pull = ~50 KB; subsequent pulls = ~5-20 KB (just the new entries since the cursor).
 - **Iroh handles NAT** -- no public IPs or port forwarding required
-- **Five custom ALPNs** -- heartbeat, push, status, logs, sync (see [docs/protocols/](docs/protocols/))
+- **Six custom ALPNs** -- heartbeat, push, status, logs, sync, shell (see [docs/protocols/](docs/protocols/))
 - **Uni-stream protocol** -- request/response over two unidirectional QUIC streams (bi-streams proved unreliable in iroh 0.35.0 Python bindings)
 - **Adaptive transport recovery** -- per-peer pull-failure counter (gated on heartbeat ALIVE). After N failures the engine rebuilds the local iroh node to reset a stuck path-picker, with a cooldown to bound repeated rebuilds. Tunable via `--refresh-after-failures` / `--refresh-cooldown`.
 - **Concurrency** -- one asyncio loop (iroh + scheduler), threads for control socket and HTTP dashboards

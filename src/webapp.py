@@ -254,9 +254,16 @@ body {
   padding: 5px 8px; width: 100%; box-sizing: border-box;
 }
 .ap-input:focus { outline: none; border-color: var(--accent); }
-.ap-perms { display: flex; flex-direction: column; gap: 3px; }
-.ap-perms label { color: var(--text-dim); font-size: 0.64rem; cursor: pointer; display: flex; align-items: center; gap: 6px; }
-.ap-perms input { accent-color: var(--accent); }
+.ap-perms { display: flex; flex-direction: column; gap: 8px; }
+.ap-perms .perm { font-size: 0.64rem; cursor: pointer; display: flex; align-items: flex-start; gap: 7px; }
+.ap-perms .perm input { accent-color: var(--accent); margin-top: 2px; flex-shrink: 0; }
+.ap-perms .perm.disabled { opacity: 0.45; cursor: not-allowed; }
+.perm-text { display: flex; flex-direction: column; gap: 1px; }
+.perm-text b { color: var(--text-bright); font-weight: 600; letter-spacing: 0.3px; }
+.perm-desc { color: var(--text-dim); font-size: 0.58rem; line-height: 1.35; }
+.perm-danger b { color: var(--accent-light); }
+.perm-tag { display: inline-block; font-size: 0.5rem; letter-spacing: 1px; padding: 0 4px; margin-left: 4px;
+            border: 1px solid var(--accent-light); color: var(--accent-light); border-radius: 2px; vertical-align: middle; }
 .ap-msg { font-size: 0.62rem; min-height: 0.9rem; letter-spacing: 0.5px; }
 .ap-msg.error { color: var(--red); }
 .ap-msg.ok { color: var(--accent); }
@@ -567,10 +574,20 @@ footer.foot {
         <div class="card-label">[Add node]</div>
         <input class="ap-input" id="ap-nodeid" placeholder="64-char node id" maxlength="64" spellcheck="false" autocomplete="off">
         <input class="ap-input" id="ap-alias" placeholder="alias (optional)" maxlength="64" autocomplete="off">
+        <div class="card-label" style="margin-top:2px;">[Permissions this peer gets]</div>
         <div class="ap-perms">
-          <label><input type="checkbox" id="ap-monitor" checked> monitor</label>
-          <label><input type="checkbox" id="ap-dash"> view_dashboard</label>
-          <label><input type="checkbox" id="ap-shell"> shell</label>
+          <label class="perm" id="ap-dash-row">
+            <input type="checkbox" id="ap-dash">
+            <span class="perm-text"><b>view_dashboard</b><span class="perm-desc" id="ap-dash-desc">Read-only — dashboard + logs, no probing. A narrower subset of monitor.</span></span>
+          </label>
+          <label class="perm">
+            <input type="checkbox" id="ap-monitor" checked>
+            <span class="perm-text"><b>monitor</b><span class="perm-desc">Full access — heartbeat probes, live stats, container logs, and your dashboard. The usual grant.</span></span>
+          </label>
+          <label class="perm perm-danger">
+            <input type="checkbox" id="ap-shell">
+            <span class="perm-text"><b>shell</b><span class="perm-tag">RCE</span><span class="perm-desc">Live remote bash on this node — effectively command execution. Never implied by the others; grant only to peers you fully trust.</span></span>
+          </label>
         </div>
         <button class="btn" id="ap-submit">[Add peer]</button>
         <div class="ap-msg" id="ap-msg"></div>
@@ -734,6 +751,21 @@ footer.foot {
 <script>
 (function () {
   'use strict';
+
+  // ── Auth token ──────────────────────────────────────────────────────
+  // The daemon prints a URL like http://127.0.0.1:42069/?t=… — read it once,
+  // strip it from the address bar, and replay it as a header on API calls
+  // (and as ?t= on the shell WebSocket / incident links).
+  const TOKEN = new URLSearchParams(location.search).get('t') || '';
+  if (TOKEN) { try { history.replaceState(null, '', location.pathname); } catch (e) {} }
+  const TOKEN_Q = TOKEN ? ('?t=' + encodeURIComponent(TOKEN)) : '';
+  function authFetch(url, opts) {
+    opts = opts || {};
+    const h = new Headers(opts.headers || {});
+    if (TOKEN) h.set('X-Panic-Token', TOKEN);
+    opts.headers = h;
+    return fetch(url, opts);
+  }
 
   // ── State ───────────────────────────────────────────────────────────
   const POLL_KEY = 'panic-monitor.poll-interval';
@@ -937,7 +969,7 @@ footer.foot {
     termState.fit = fit;
 
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(proto + '://' + location.host + '/api/node/' + nid + '/shell');
+    const ws = new WebSocket(proto + '://' + location.host + '/api/node/' + nid + '/shell' + TOKEN_Q);
     ws.binaryType = 'arraybuffer';
     termState.ws = ws;
     const enc = new TextEncoder();
@@ -1027,7 +1059,7 @@ footer.foot {
     rpYes.disabled = true; rpNo.disabled = true;
     rpStatus.textContent = 'removing…'; rpStatus.className = 'term-status';
     try {
-      const r = await fetch('/api/peers/' + nid, { method: 'DELETE' });
+      const r = await authFetch('/api/peers/' + nid, { method: 'DELETE' });
       const body = await r.json().catch(() => ({}));
       if (r.ok && body.ok) {
         rpConfirm.style.display = 'none';
@@ -1184,7 +1216,7 @@ footer.foot {
     incEmpty.style.display = 'none';
     // The card only holds the recent slice; the full, unscrolled history lives
     // on a dedicated page so you can read days of incidents without scrubbing.
-    incViewAll.href = '/incidents/' + encodeURIComponent(getNodeId(node));
+    incViewAll.href = '/incidents/' + encodeURIComponent(getNodeId(node)) + TOKEN_Q;
     incViewAll.style.display = 'block';
     incList.innerHTML = list.map(inc => {
       const start = new Date(inc.started);
@@ -1434,7 +1466,7 @@ footer.foot {
     logsEl.classList.add('placeholder');
     logsEl.classList.remove('error');
     try {
-      const r = await fetch(`/api/node/${nid}/container/${cid}/logs?tail=20`, { signal: controller.signal });
+      const r = await authFetch(`/api/node/${nid}/container/${cid}/logs?tail=20`, { signal: controller.signal });
       const data = await r.json();
       const state = logState.get(key);
       if (!state || state.token !== token || state.el !== el || !el.open || el.dataset.id !== cid || el.dataset.nodeId !== nid) return;
@@ -1496,7 +1528,7 @@ footer.foot {
     if (inFlight) return;
     inFlight = true;
     try {
-      const r = await fetch('/api/dashboard', { cache: 'no-store' });
+      const r = await authFetch('/api/dashboard', { cache: 'no-store' });
       const d = await r.json();
       ownNodeId = getNodeId(d);
       setText(nodeVal, ownNodeId ? ownNodeId.slice(0, 12) + '...' + ownNodeId.slice(-4) : '—');
@@ -1593,6 +1625,26 @@ footer.foot {
   const apShell = $('ap-shell');
   const apSubmit = $('ap-submit');
   const apMsg = $('ap-msg');
+  const apDashRow = $('ap-dash-row');
+  const apDashDesc = $('ap-dash-desc');
+
+  // monitor already includes everything view_dashboard grants, so when monitor
+  // is on we disable view_dashboard and say why — encoding the subset relation.
+  function syncDashState() {
+    if (!apDash) return;
+    if (apMonitor && apMonitor.checked) {
+      apDash.checked = false;
+      apDash.disabled = true;
+      if (apDashRow) apDashRow.classList.add('disabled');
+      if (apDashDesc) apDashDesc.textContent = 'Already included in monitor — check this only without monitor, to grant read-only access.';
+    } else {
+      apDash.disabled = false;
+      if (apDashRow) apDashRow.classList.remove('disabled');
+      if (apDashDesc) apDashDesc.textContent = 'Read-only — dashboard + logs, no probing. A narrower subset of monitor.';
+    }
+  }
+  if (apMonitor) apMonitor.addEventListener('change', syncDashState);
+  syncDashState();
 
   function setApMsg(text, kind) {
     if (!apMsg) return;
@@ -1612,13 +1664,17 @@ footer.foot {
     if (apShell.checked) perms.push('shell');
     if (!perms.length) { setApMsg('select at least one permission', 'error'); return; }
 
+    // Trusting a new peer is a sensitive change — require the identity password.
+    const pw = window.prompt('Enter your identity password to authorize adding this peer:');
+    if (pw === null || pw === '') { setApMsg('cancelled', ''); return; }
+
     apSubmit.disabled = true;
     setApMsg('adding…', '');
     try {
-      const r = await fetch('/api/peers', {
+      const r = await authFetch('/api/peers', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ node_id: nid, alias: (apAlias.value || '').trim(), permissions: perms }),
+        body: JSON.stringify({ node_id: nid, alias: (apAlias.value || '').trim(), permissions: perms, password: pw }),
       });
       const body = await r.json().catch(() => ({}));
       if (r.ok && body.ok) {
@@ -1914,8 +1970,12 @@ def _serve_local_shell(ws, engine) -> None:
         SHELL_TAG_DATA, SHELL_TAG_RESIZE, SHELL_TAG_CLOSE, SHELL_TAG_EXIT,
     )
 
+    from src.sysenv import system_env
+
     master_fd, slave_fd = _pty.openpty()
-    env = {**_os.environ, "TERM": "xterm-256color"}
+    # system_env() strips the bundled lib path so the spawned shell (and the
+    # commands run inside it) use the host's libraries, not ours.
+    env = system_env({"TERM": "xterm-256color"})
     try:
         proc = _subprocess.Popen(
             ["/bin/bash", "-i"],
@@ -2029,6 +2089,8 @@ class WebApp:
         # actually drain in-flight handlers before the engine closes its
         # SQLite stores.
         self._server = None
+        self._token: Optional[str] = None      # loopback dashboard auth token
+        self._url_path: Optional[Path] = None  # runtime file holding the tokenized URL
 
     def start(self) -> None:
         if not _FLASK_OK:
@@ -2045,6 +2107,61 @@ class WebApp:
 
         engine = self._engine
 
+        # --- Auth: loopback token + Origin/Host allowlist ------------------
+        # The dashboard binds to 127.0.0.1, but loopback isn't a security
+        # boundary on its own: a malicious web page can reach it (WS bypasses
+        # CORS preflight) and any local process can connect. So gate it with a
+        # per-startup token (carried in the URL the daemon prints) and reject
+        # foreign-Origin browser requests.
+        import os as _os
+        import secrets as _secrets
+        from src import paths as _paths
+
+        self._token = _secrets.token_urlsafe(32)
+        dash_url = f"http://127.0.0.1:{self._port}/?t={self._token}"
+        try:
+            rt = _paths.ensure_runtime_dir()
+            url_path = rt / _paths.DASHBOARD_URL_NAME
+            fd = _os.open(str(url_path), _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
+            try:
+                _os.write(fd, dash_url.encode())
+            finally:
+                _os.close(fd)
+            _os.chmod(url_path, 0o600)  # in case it pre-existed with looser mode
+            self._url_path = url_path
+        except OSError as exc:
+            logger.warning("[webapp] could not write dashboard url file: {}", exc)
+            self._url_path = None
+
+        _token = self._token
+        _allowed_origins = {
+            f"http://127.0.0.1:{self._port}",
+            f"http://localhost:{self._port}",
+            f"http://[::1]:{self._port}",
+        }
+        _allowed_hosts = {
+            f"127.0.0.1:{self._port}", f"localhost:{self._port}", f"[::1]:{self._port}",
+            "127.0.0.1", "localhost", "[::1]",
+        }
+
+        @self._app.before_request
+        def _guard():
+            # (a) Block foreign-origin browser requests (CSRF / DNS-rebinding).
+            origin = request.headers.get("Origin")
+            if origin is not None and origin not in _allowed_origins:
+                return jsonify({"error": "forbidden origin"}), 403
+            host = request.headers.get("Host", "")
+            if host and host not in _allowed_hosts:
+                return jsonify({"error": "forbidden host"}), 403
+            # (b) Loopback token. Exempt GET / so the SPA can bootstrap: its URL
+            #     carries the token, which it strips and then replays as a header.
+            if request.path == "/" and request.method == "GET":
+                return None
+            supplied = request.headers.get("X-Panic-Token") or request.args.get("t", "")
+            if not _secrets.compare_digest(supplied, _token):
+                return jsonify({"error": "unauthorized"}), 401
+            return None
+
         @self._app.route("/")
         def index():
             return render_template_string(_HTML, ascii_svg=_ASCII_SVG)
@@ -2056,6 +2173,9 @@ class WebApp:
         @self._app.route("/api/peers", methods=["POST"])
         def api_add_peer():
             data = request.get_json(silent=True) or {}
+            # Sensitive trust mutation — require the identity password.
+            if not engine.verify_identity_password(data.get("password") or ""):
+                return jsonify({"error": "password verification failed"}), 403
             node_id = (data.get("node_id") or "").strip().lower()
             alias = (data.get("alias") or "").strip() or None
             perms = data.get("permissions") or ["monitor"]
@@ -2196,6 +2316,16 @@ class WebApp:
             @self._sock.route("/api/node/<nid>/shell")
             def node_shell(ws, nid):
                 from src.identity import validate_node_id
+                # before_request already enforces Origin+token, but re-check here
+                # (browser WS carries the token as ?t=) so a flask-sock change
+                # can't silently reopen this RCE surface.
+                origin = request.headers.get("Origin")
+                if origin is not None and origin not in _allowed_origins:
+                    ws.close()
+                    return
+                if not _secrets.compare_digest(request.args.get("t", ""), _token):
+                    ws.close()
+                    return
                 if not validate_node_id(nid):
                     ws.close()
                     return
@@ -2216,7 +2346,7 @@ class WebApp:
             name="webapp",
         )
         self._thread.start()
-        logger.info("[webapp] started on http://127.0.0.1:{}", self._port)
+        logger.info("[webapp] started — open the dashboard at: {}", dash_url)
 
     def stop(self) -> None:
         if self._server is None:
@@ -2228,6 +2358,11 @@ class WebApp:
             logger.debug("[webapp] shutdown error: {}", exc)
         if self._thread is not None:
             self._thread.join(timeout=5)
+        if self._url_path is not None:
+            try:
+                self._url_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         self._server = None
         self._thread = None
 
